@@ -2,8 +2,8 @@
 /**
  * Plugin Name: GLS Italy WooCommerce Integration (Avanzato)
  * Description: Integrazione con API GLS (Label Service MU162). Include Pannello Impostazioni, Gestione Contrassegno e Cronjob (CloseWorkDay).
- * Version: 2.0
- * Author: Il tuo nome
+ * Version: 1.0.1
+ * Author: Dream2Dev
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -292,4 +292,137 @@ function gls_manual_cwd_handler() {
     }
 }
 
+// --- SEZIONE 4: METODO DI SPEDIZIONE WOOCOMMERCE CON TARIFFE GLS ---
+
+add_action( 'woocommerce_shipping_init', 'gls_custom_shipping_method_init' );
+
+function gls_custom_shipping_method_init() {
+    if ( ! class_exists( 'WC_GLS_Contract_Shipping_Method' ) ) {
+        class WC_GLS_Contract_Shipping_Method extends WC_Shipping_Method {
+
+            public function __construct() {
+                $this->id                 = 'gls_contract_shipping';
+                $this->method_title       = 'Corriere GLS (Contratto)';
+                $this->method_description = 'Calcola le tariffe di spedizione in base agli scaglioni di peso e alle zone del tuo contratto GLS.';
+
+                $this->availability = 'including';
+                $this->countries = array( 'IT' );
+
+                $this->init();
+                $this->enabled = isset( $this->settings['enabled'] ) ? $this->settings['enabled'] : 'yes';
+                $this->title   = isset( $this->settings['title'] ) ? $this->settings['title'] : 'Corriere Espresso GLS';
+            }
+
+            public function init() {
+                $this->init_form_fields();
+                $this->init_settings();
+
+                add_action( 'woocommerce_update_options_shipping_' . $this->id, array( $this, 'process_admin_options' ) );
+            }
+
+            public function init_form_fields() {
+                // Qui creiamo i campi dove potrai inserire i prezzi del tuo PDF
+                $this->form_fields = array(
+                    'enabled' => array(
+                        'title'   => 'Abilita/Disabilita',
+                        'type'    => 'checkbox',
+                        'label'   => 'Abilita questo metodo di spedizione',
+                        'default' => 'yes',
+                    ),
+                    'title' => array(
+                        'title'       => 'Titolo al Checkout',
+                        'type'        => 'text',
+                        'description' => 'Il nome che vedrà il cliente nel carrello.',
+                        'default'     => 'Corriere Espresso GLS',
+                    ),
+                    'rate_0_3' => array(
+                        'title'       => 'Tariffa da 0 a 3 Kg (€)',
+                        'type'        => 'number',
+                        'custom_attributes' => array( 'step' => '0.01' ),
+                        'default'     => '6.00',
+                    ),
+                    'rate_3_5' => array(
+                        'title'       => 'Tariffa da 3 a 5 Kg (€)',
+                        'type'        => 'number',
+                        'custom_attributes' => array( 'step' => '0.01' ),
+                        'default'     => '7.50',
+                    ),
+                    'rate_5_10' => array(
+                        'title'       => 'Tariffa da 5 a 10 Kg (€)',
+                        'type'        => 'number',
+                        'custom_attributes' => array( 'step' => '0.01' ),
+                        'default'     => '9.00',
+                    ),
+                    'rate_10_20' => array(
+                        'title'       => 'Tariffa da 10 a 20 Kg (€)',
+                        'type'        => 'number',
+                        'custom_attributes' => array( 'step' => '0.01' ),
+                        'default'     => '12.00',
+                    ),
+                    'rate_extra_kg' => array(
+                        'title'       => 'Costo per ogni Kg oltre i 20 Kg (€)',
+                        'type'        => 'number',
+                        'custom_attributes' => array( 'step' => '0.01' ),
+                        'default'     => '0.50',
+                    ),
+                    'surcharge_islands' => array(
+                        'title'       => 'Maggiorazione Calabria, Sicilia e Sardegna (€)',
+                        'type'        => 'number',
+                        'description' => 'Costo FISSO da sommare alla tariffa base per queste regioni.',
+                        'custom_attributes' => array( 'step' => '0.01' ),
+                        'default'     => '2.00',
+                    ),
+                );
+            }
+
+            public function calculate_shipping( $package = array() ) {
+                $weight = WC()->cart->get_cart_contents_weight();
+                $destination_state = $package['destination']['state'];
+                
+                // Province di Sicilia, Sardegna e Calabria
+                $islands_and_calabria = array( 'AG', 'CL', 'CT', 'EN', 'ME', 'PA', 'RG', 'SR', 'TP', 'CA', 'NU', 'OR', 'SS', 'SU', 'CZ', 'CS', 'KR', 'RC', 'VV' );
+
+                $cost = 0;
+
+                // Calcolo in base agli scaglioni di peso
+                if ( $weight <= 3 ) {
+                    $cost = $this->get_option( 'rate_0_3' );
+                } elseif ( $weight <= 5 ) {
+                    $cost = $this->get_option( 'rate_3_5' );
+                } elseif ( $weight <= 10 ) {
+                    $cost = $this->get_option( 'rate_5_10' );
+                } elseif ( $weight <= 20 ) {
+                    $cost = $this->get_option( 'rate_10_20' );
+                } else {
+                    $base_cost = $this->get_option( 'rate_10_20' );
+                    $extra_weight = ceil( $weight - 20 ); // Arrotonda per eccesso i kg extra
+                    $extra_cost = $extra_weight * $this->get_option( 'rate_extra_kg' );
+                    $cost = $base_cost + $extra_cost;
+                }
+
+                // Aggiungi maggiorazione Isole e Calabria
+                if ( in_array( $destination_state, $islands_and_calabria ) ) {
+                    $cost += $this->get_option( 'surcharge_islands' );
+                }
+
+                $rate = array(
+                    'id'    => $this->id,
+                    'label' => $this->title,
+                    'cost'  => $cost,
+                );
+
+                $this->add_rate( $rate );
+            }
+        }
+    }
+}
+
+add_filter( 'woocommerce_shipping_methods', 'add_gls_custom_shipping_method' );
+function add_gls_custom_shipping_method( $methods ) {
+    $methods['gls_contract_shipping'] = 'WC_GLS_Contract_Shipping_Method';
+    return $methods;
+}
+
+
 new GLS_WooCommerce_Integration_Advanced();
+
