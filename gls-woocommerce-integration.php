@@ -3,7 +3,7 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.0.5
+ * Version: 1.0.6
  * Author: Dream2Dev
  */
 
@@ -52,13 +52,12 @@ class GLS_GitHub_Updater {
         $plugin_data = get_plugin_data( $this->file );
         $current_version = $plugin_data['Version'];
 
-        // Se la versione su GitHub (tag) è maggiore della nostra, notifica l'update
         if ( version_compare( $current_version, str_replace('v', '', $github_info->tag_name), '<' ) ) {
             $obj = new stdClass();
             $obj->slug = $this->basename;
             $obj->new_version = $github_info->tag_name;
             $obj->url = $plugin_data['PluginURI'];
-            $obj->package = $github_info->zipball_url; // Scarica lo zip direttamente da GitHub
+            $obj->package = $github_info->zipball_url; 
             $transient->response[$this->basename] = $obj;
         }
         return $transient;
@@ -112,7 +111,7 @@ class GLS_WooCommerce_Integration_Advanced {
     }
 
     public function process_gls_order_action( $order ) {
-        $this->generate_gls_shipment( $order->get_id(), true ); // true forza la rigenerazione
+        $this->generate_gls_shipment( $order->get_id(), true ); 
     }
 
     public function add_admin_menu() {
@@ -139,7 +138,7 @@ class GLS_WooCommerce_Integration_Advanced {
                     <tr><th scope="row">Sede GLS (Sigla)</th><td><input type="text" name="gls_sede" value="<?php echo esc_attr( get_option( 'gls_sede' ) ); ?>" maxlength="2" placeholder="Es. MI" /></td></tr>
                     <tr><th scope="row">Codice Cliente</th><td><input type="text" name="gls_codice_cliente" value="<?php echo esc_attr( get_option( 'gls_codice_cliente' ) ); ?>" /></td></tr>
                     <tr><th scope="row">Password</th><td><input type="password" name="gls_password" value="<?php echo esc_attr( get_option( 'gls_password' ) ); ?>" /></td></tr>
-                    <tr><th scope="row">Codice Contratto</th><td><input type="text" name="gls_codice_contratto" value="<?php echo esc_attr( get_option( 'gls_codice_contratto' ) ); ?>" /></td></tr>
+                    <tr><th scope="row">Codice Contratto (Obbligatorio)</th><td><input type="text" name="gls_codice_contratto" value="<?php echo esc_attr( get_option( 'gls_codice_contratto' ) ); ?>" placeholder="Es. 0000" /></td></tr>
                     <tr>
                         <th scope="row">Abilita Trasmissione Contrassegno</th>
                         <td><label><input type="checkbox" name="gls_enable_cod" value="yes" <?php checked( get_option( 'gls_enable_cod' ), 'yes' ); ?> /> Trasmetti a GLS l'incasso del contrassegno (COD).</label></td>
@@ -165,7 +164,6 @@ class GLS_WooCommerce_Integration_Advanced {
     public function generate_gls_shipment( $order_id, $force = false ) {
         $order = wc_get_order( $order_id );
         
-        // Evita duplicati, a meno che non sia forzato manualmente
         if ( ! $force && get_post_meta( $order_id, '_gls_tracking_number', true ) ) {
             return;
         }
@@ -216,7 +214,7 @@ class GLS_WooCommerce_Integration_Advanced {
         $xml = '<?xml version="1.0" encoding="utf-8"?><Info>';
         $xml .= '<SedeGls>' . esc_html( $sede ) . '</SedeGls><CodiceClienteGls>' . esc_html( $cliente ) . '</CodiceClienteGls><PasswordClienteGls>' . esc_html( $password ) . '</PasswordClienteGls><AddParcelResult>S</AddParcelResult><Parcel>';
         
-        // Formattazione forzata a 4 cifre (es. se inserisci 0 o 1, diventa 0000 o 0001)
+        // Formattazione forzata a 4 cifre per evitare l'errore di Contratto non valido
         if ( ! empty( $contratto ) || $contratto === '0' ) {
             $contratto_padded = str_pad( trim( $contratto ), 4, '0', STR_PAD_LEFT );
             $xml .= '<CodiceContrattoGls>' . esc_html( $contratto_padded ) . '</CodiceContrattoGls>';
@@ -233,6 +231,39 @@ class GLS_WooCommerce_Integration_Advanced {
         $xml .= '<IndirizzoEmail><![CDATA[' . esc_html( $order->get_billing_email() ) . ']]></IndirizzoEmail>';
         $xml .= '</Parcel></Info>';
         return $xml;
+    }
+
+    private function parse_gls_response( $xml_response, $order ) {
+        $xml = @simplexml_load_string( $xml_response );
+        if ( $xml === false ) {
+            $order->add_order_note( 'GLS Error: Risposta XML dal server incomprensibile.' );
+            return;
+        }
+
+        if ( isset( $xml->Parcel->DescrizioneErrore ) && !empty( (string) $xml->Parcel->DescrizioneErrore ) ) {
+            $order->add_order_note( 'Errore GLS (API): ' . (string) $xml->Parcel->DescrizioneErrore ); 
+            return;
+        }
+        
+        if ( isset( $xml->Parcel->NoteSpedizione ) && strpos( (string) $xml->Parcel->NoteSpedizione, 'Dati non accettabili' ) !== false ) {
+            $order->add_order_note( 'Errore GLS (Dati non validi): ' . (string) $xml->Parcel->NoteSpedizione ); 
+            return;
+        }
+
+        if ( isset( $xml->Parcel->NumeroSpedizione ) ) {
+            $track = (string) $xml->Parcel->NumeroSpedizione;
+            update_post_meta( $order->get_id(), '_gls_tracking_number', $track );
+            $note = 'Spedizione GLS creata con successo. Tracking: ' . $track;
+            if ( isset( $xml->Parcel->PdfLabel ) && !empty( (string) $xml->Parcel->PdfLabel ) ) {
+                $pdf_path = wp_upload_dir()['path'] . '/GLS_Label_' . $track . '.pdf';
+                $pdf_url = wp_upload_dir()['url'] . '/GLS_Label_' . $track . '.pdf';
+                file_put_contents( $pdf_path, base64_decode( (string) $xml->Parcel->PdfLabel ) );
+                $note .= ' | <a href="' . $pdf_url . '" target="_blank">Scarica Etichetta PDF</a>';
+            }
+            $order->add_order_note( $note );
+        } else {
+            $order->add_order_note( 'GLS Info: Nessun tracking trovato. Struttura: ' . print_r($xml, true) );
+        }
     }
 
     public function schedule_cron() { /* Cron setup */ }
@@ -330,7 +361,7 @@ function add_gls_custom_shipping_method( $methods ) {
     $methods['gls_contract_shipping'] = 'WC_GLS_Contract_Shipping_Method'; return $methods;
 }
 
-// --- CALCOLO SOVRATASSA CONTRASSEGNO NEL CARRELLO (AGGIORNATO) ---
+// --- CALCOLO SOVRATASSA CONTRASSEGNO NEL CARRELLO ---
 add_action( 'woocommerce_cart_calculate_fees', 'gls_add_cod_fee', 20, 1 );
 function gls_add_cod_fee( $cart ) {
     if ( is_admin() && ! defined( 'DOING_AJAX' ) ) return;
