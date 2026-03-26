@@ -3,7 +3,7 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.0.4
+ * Version: 1.0.5
  * Author: Dream2Dev
  */
 
@@ -200,11 +200,11 @@ class GLS_WooCommerce_Integration_Advanced {
         $this->parse_gls_response( $body, $order );
     }
 
-   private function build_add_parcel_xml( $order ) {
+    private function build_add_parcel_xml( $order ) {
         $sede = get_option( 'gls_sede' ); 
         $cliente = get_option( 'gls_codice_cliente' ); 
         $password = get_option( 'gls_password' );
-        $contratto = get_option( 'gls_codice_contratto' ); // <-- Ripristinato il recupero del contratto!
+        $contratto = get_option( 'gls_codice_contratto' );
 
         if ( empty( $sede ) || empty( $cliente ) || empty( $password ) ) return false;
 
@@ -216,9 +216,10 @@ class GLS_WooCommerce_Integration_Advanced {
         $xml = '<?xml version="1.0" encoding="utf-8"?><Info>';
         $xml .= '<SedeGls>' . esc_html( $sede ) . '</SedeGls><CodiceClienteGls>' . esc_html( $cliente ) . '</CodiceClienteGls><PasswordClienteGls>' . esc_html( $password ) . '</PasswordClienteGls><AddParcelResult>S</AddParcelResult><Parcel>';
         
-        // <-- Ripristinato l'inserimento del contratto nell'XML
-        if ( ! empty( $contratto ) ) {
-            $xml .= '<CodiceContrattoGls>' . esc_html( $contratto ) . '</CodiceContrattoGls>';
+        // Formattazione forzata a 4 cifre (es. se inserisci 0 o 1, diventa 0000 o 0001)
+        if ( ! empty( $contratto ) || $contratto === '0' ) {
+            $contratto_padded = str_pad( trim( $contratto ), 4, '0', STR_PAD_LEFT );
+            $xml .= '<CodiceContrattoGls>' . esc_html( $contratto_padded ) . '</CodiceContrattoGls>';
         }
         
         $xml .= '<RagioneSociale><![CDATA[' . substr( $ragione_sociale, 0, 35 ) . ']]></RagioneSociale>';
@@ -232,40 +233,6 @@ class GLS_WooCommerce_Integration_Advanced {
         $xml .= '<IndirizzoEmail><![CDATA[' . esc_html( $order->get_billing_email() ) . ']]></IndirizzoEmail>';
         $xml .= '</Parcel></Info>';
         return $xml;
-    }
-
-    private function parse_gls_response( $xml_response, $order ) {
-        $xml = @simplexml_load_string( $xml_response );
-        if ( $xml === false ) {
-            $order->add_order_note( 'GLS Error: Risposta XML dal server incomprensibile.' );
-            return;
-        }
-
-        if ( isset( $xml->Parcel->DescrizioneErrore ) && !empty( (string) $xml->Parcel->DescrizioneErrore ) ) {
-            $order->add_order_note( 'Errore GLS (API): ' . (string) $xml->Parcel->DescrizioneErrore ); 
-            return;
-        }
-        
-        // <-- Nuovo controllo per intercettare l'errore che abbiamo appena scoperto dal tuo log
-        if ( isset( $xml->Parcel->NoteSpedizione ) && strpos( (string) $xml->Parcel->NoteSpedizione, 'Dati non accettabili' ) !== false ) {
-            $order->add_order_note( 'Errore GLS (Dati non validi): ' . (string) $xml->Parcel->NoteSpedizione ); 
-            return;
-        }
-
-        if ( isset( $xml->Parcel->NumeroSpedizione ) ) {
-            $track = (string) $xml->Parcel->NumeroSpedizione;
-            update_post_meta( $order->get_id(), '_gls_tracking_number', $track );
-            $note = 'Spedizione GLS creata con successo. Tracking: ' . $track;
-            if ( isset( $xml->Parcel->PdfLabel ) && !empty( (string) $xml->Parcel->PdfLabel ) ) {
-                $pdf_path = wp_upload_dir()['path'] . '/GLS_Label_' . $track . '.pdf';
-                $pdf_url = wp_upload_dir()['url'] . '/GLS_Label_' . $track . '.pdf';
-                file_put_contents( $pdf_path, base64_decode( (string) $xml->Parcel->PdfLabel ) );
-                $note .= ' | <a href="' . $pdf_url . '" target="_blank">Scarica Etichetta PDF</a>';
-            }
-            $order->add_order_note( $note );
-        } else {
-            $order->add_order_note( 'GLS Info: Nessun tracking trovato. Struttura: ' . print_r($xml, true) );
-        }
     }
 
     public function schedule_cron() { /* Cron setup */ }
