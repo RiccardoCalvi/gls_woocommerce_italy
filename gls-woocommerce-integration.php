@@ -1,6 +1,7 @@
 <?php
 /**
  * Plugin Name: GLS Italy WooCommerce Integration
+ * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
  * Version: 1.0.3
  * Author: Dream2Dev
@@ -10,6 +11,82 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
+// --- CLASSE PER AUTO-UPDATE DA GITHUB ---
+class GLS_GitHub_Updater {
+    private $file;
+    private $plugin;
+    private $basename;
+    private $active;
+    private $username;
+    private $repository;
+
+    public function __construct( $file ) {
+        $this->file = $file;
+        $this->add_plugin_hooks();
+        
+        // Sostituisci questi con i tuoi dati GitHub
+        $this->username = 'RiccardoCalvi'; 
+        $this->repository = 'gls_woocommerce_italy';
+    }
+
+    private function add_plugin_hooks() {
+        $this->plugin = plugin_basename( $this->file );
+        $this->basename = plugin_basename( $this->file );
+        $this->active = is_plugin_active( $this->basename );
+        add_filter( 'pre_set_site_transient_update_plugins', array( $this, 'check_update' ) );
+        add_filter( 'plugins_api', array( $this, 'plugin_info' ), 10, 3 );
+    }
+
+    private function get_repository_info() {
+        $request_uri = sprintf( 'https://api.github.com/repos/%s/%s/releases/latest', $this->username, $this->repository );
+        $response = wp_remote_get( $request_uri, array( 'timeout' => 10 ) );
+        if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) != 200 ) return false;
+        return json_decode( wp_remote_retrieve_body( $response ) );
+    }
+
+    public function check_update( $transient ) {
+        if ( empty( $transient->checked ) ) return $transient;
+        $github_info = $this->get_repository_info();
+        if ( ! $github_info ) return $transient;
+
+        $plugin_data = get_plugin_data( $this->file );
+        $current_version = $plugin_data['Version'];
+
+        // Se la versione su GitHub (tag) è maggiore della nostra, notifica l'update
+        if ( version_compare( $current_version, str_replace('v', '', $github_info->tag_name), '<' ) ) {
+            $obj = new stdClass();
+            $obj->slug = $this->basename;
+            $obj->new_version = $github_info->tag_name;
+            $obj->url = $plugin_data['PluginURI'];
+            $obj->package = $github_info->zipball_url; // Scarica lo zip direttamente da GitHub
+            $transient->response[$this->basename] = $obj;
+        }
+        return $transient;
+    }
+
+    public function plugin_info( $res, $action, $args ) {
+        if ( $action !== 'plugin_information' || current_filter() !== 'plugins_api' ) return $res;
+        if ( isset( $args->slug ) && $args->slug === $this->basename ) {
+            $github_info = $this->get_repository_info();
+            if ( $github_info ) {
+                $plugin_data = get_plugin_data( $this->file );
+                $res = new stdClass();
+                $res->name = $plugin_data['Name'];
+                $res->slug = $this->basename;
+                $res->version = $github_info->tag_name;
+                $res->author = $plugin_data['Author'];
+                $res->homepage = $plugin_data['PluginURI'];
+                $res->download_link = $github_info->zipball_url;
+                $res->sections = array( 'description' => $plugin_data['Description'], 'changelog' => nl2br( $github_info->body ) );
+            }
+        }
+        return $res;
+    }
+}
+new GLS_GitHub_Updater( __FILE__ );
+
+
+// --- CORE DEL PLUGIN GLS ---
 class GLS_WooCommerce_Integration_Advanced {
 
     private $api_url_addparcel = 'https://labelservice.gls-italy.com/ilswebservice.asmx/AddParcel';
@@ -17,11 +94,25 @@ class GLS_WooCommerce_Integration_Advanced {
 
     public function __construct() {
         add_action( 'woocommerce_order_status_processing', array( $this, 'generate_gls_shipment' ), 10, 1 );
+        
+        // Azione manuale nell'ordine
+        add_action( 'woocommerce_order_actions', array( $this, 'add_gls_order_action' ) );
+        add_action( 'woocommerce_order_action_gls_generate_label', array( $this, 'process_gls_order_action' ) );
+
         add_action( 'admin_menu', array( $this, 'add_admin_menu' ) );
         add_action( 'admin_init', array( $this, 'register_settings' ) );
         add_action( 'init', array( $this, 'schedule_cron' ) );
         add_action( 'gls_daily_close_work_day', array( $this, 'execute_close_work_day' ) );
         register_deactivation_hook( __FILE__, array( $this, 'clear_cron' ) );
+    }
+
+    public function add_gls_order_action( $actions ) {
+        $actions['gls_generate_label'] = 'Genera/Rigenera Etichetta GLS';
+        return $actions;
+    }
+
+    public function process_gls_order_action( $order ) {
+        $this->generate_gls_shipment( $order->get_id(), true ); // true forza la rigenerazione
     }
 
     public function add_admin_menu() {
@@ -71,18 +162,42 @@ class GLS_WooCommerce_Integration_Advanced {
         <?php
     }
 
-    public function generate_gls_shipment( $order_id ) {
-        if ( get_post_meta( $order_id, '_gls_tracking_number', true ) ) return;
+    public function generate_gls_shipment( $order_id, $force = false ) {
         $order = wc_get_order( $order_id );
-        $xml_data = $this->build_add_parcel_xml( $order );
-        if ( ! $xml_data ) return;
-
-        $response = wp_remote_post( $this->api_url_addparcel, array( 'method' => 'POST', 'timeout' => 45, 'body' => array( 'XMLInfoParcel' => $xml_data ) ) );
-        if ( is_wp_error( $response ) ) {
-            $order->add_order_note( 'Errore GLS: ' . $response->get_error_message() );
+        
+        // Evita duplicati, a meno che non sia forzato manualmente
+        if ( ! $force && get_post_meta( $order_id, '_gls_tracking_number', true ) ) {
             return;
         }
-        $this->parse_gls_response( wp_remote_retrieve_body( $response ), $order );
+
+        $xml_data = $this->build_add_parcel_xml( $order );
+        if ( ! $xml_data ) {
+            $order->add_order_note( 'GLS Error: Credenziali GLS mancanti nelle impostazioni. Etichetta non generata.' );
+            return;
+        }
+
+        $order->add_order_note( 'GLS: Inizio comunicazione con API AddParcel...' );
+
+        $response = wp_remote_post( $this->api_url_addparcel, array( 
+            'method' => 'POST', 
+            'timeout' => 45, 
+            'body' => array( 'XMLInfoParcel' => $xml_data ) 
+        ) );
+
+        if ( is_wp_error( $response ) ) {
+            $order->add_order_note( 'GLS Error di rete: ' . $response->get_error_message() );
+            return;
+        }
+
+        $http_code = wp_remote_retrieve_response_code( $response );
+        $body = wp_remote_retrieve_body( $response );
+
+        if ( $http_code != 200 ) {
+            $order->add_order_note( 'GLS HTTP Error ' . $http_code . ': Il server ha rifiutato la richiesta.' );
+            return;
+        }
+
+        $this->parse_gls_response( $body, $order );
     }
 
     private function build_add_parcel_xml( $order ) {
@@ -111,21 +226,29 @@ class GLS_WooCommerce_Integration_Advanced {
 
     private function parse_gls_response( $xml_response, $order ) {
         $xml = @simplexml_load_string( $xml_response );
-        if ( $xml === false ) return;
-        if ( isset( $xml->Parcel->DescrizioneErrore ) && !empty( (string) $xml->Parcel->DescrizioneErrore ) ) {
-            $order->add_order_note( 'Errore GLS: ' . (string) $xml->Parcel->DescrizioneErrore ); return;
+        if ( $xml === false ) {
+            $order->add_order_note( 'GLS Error: Risposta XML dal server incomprensibile. Log dati: ' . esc_html( substr($xml_response, 0, 200) ) );
+            return;
         }
+
+        if ( isset( $xml->Parcel->DescrizioneErrore ) && !empty( (string) $xml->Parcel->DescrizioneErrore ) ) {
+            $order->add_order_note( 'Errore GLS (API): ' . (string) $xml->Parcel->DescrizioneErrore ); 
+            return;
+        }
+
         if ( isset( $xml->Parcel->NumeroSpedizione ) ) {
             $track = (string) $xml->Parcel->NumeroSpedizione;
             update_post_meta( $order->get_id(), '_gls_tracking_number', $track );
-            $note = 'Tracking GLS: ' . $track;
+            $note = 'Spedizione GLS creata con successo. Tracking: ' . $track;
             if ( isset( $xml->Parcel->PdfLabel ) && !empty( (string) $xml->Parcel->PdfLabel ) ) {
                 $pdf_path = wp_upload_dir()['path'] . '/GLS_Label_' . $track . '.pdf';
                 $pdf_url = wp_upload_dir()['url'] . '/GLS_Label_' . $track . '.pdf';
                 file_put_contents( $pdf_path, base64_decode( (string) $xml->Parcel->PdfLabel ) );
-                $note .= ' | <a href="' . $pdf_url . '" target="_blank">Scarica Etichetta</a>';
+                $note .= ' | <a href="' . $pdf_url . '" target="_blank">Scarica Etichetta PDF</a>';
             }
             $order->add_order_note( $note );
+        } else {
+            $order->add_order_note( 'GLS Info: Risposta completata ma nessun tracking trovato. Struttura: ' . print_r($xml, true) );
         }
     }
 
@@ -144,7 +267,6 @@ function gls_manual_cwd_handler() {
 new GLS_WooCommerce_Integration_Advanced();
 
 // --- TARIFFE E METODO DI SPEDIZIONE CON CAMPI MODIFICABILI ---
-
 add_action( 'woocommerce_shipping_init', 'gls_custom_shipping_method_init' );
 function gls_custom_shipping_method_init() {
     if ( ! class_exists( 'WC_GLS_Contract_Shipping_Method' ) ) {
@@ -183,14 +305,13 @@ function gls_custom_shipping_method_init() {
 
             public function calculate_shipping( $package = array() ) {
                 $weight = WC()->cart->get_cart_contents_weight();
-                if ( $weight <= 0 ) $weight = 1; // Peso minimo di sicurezza
+                if ( $weight <= 0 ) $weight = 1; 
 
                 $state = $package['destination']['state'];
                 $postcode = $package['destination']['postcode'];
                 
                 $cost = 0;
                 
-                // Calcolo Base Italia
                 if ( $weight <= 3 ) $cost = (float) $this->get_option( 'rate_0_3' );
                 elseif ( $weight <= 5 ) $cost = (float) $this->get_option( 'rate_3_5' );
                 elseif ( $weight <= 10 ) $cost = (float) $this->get_option( 'rate_5_10' );
@@ -205,15 +326,12 @@ function gls_custom_shipping_method_init() {
                     $cost = $base_100 + ( ceil( $weight - 100 ) * $extra_rate );
                 }
 
-                // Maggiorazione Isole e Calabria
                 $islands = array( 'AG','CL','CT','EN','ME','PA','RG','SR','TP', 'CA','NU','OR','SS','SU', 'CZ','CS','KR','RC','VV' );
                 if ( in_array( $state, $islands ) ) {
                     $cost += (float) $this->get_option( 'rate_islands' );
-                    // Dal tuo contratto l'extra kg isole costa 0.24 anziché 0.22 (0.02 in più)
                     if ( $weight > 100 ) $cost += ( ceil( $weight - 100 ) * 0.02 );
                 }
 
-                // Maggiorazione Isole Minori e Venezia
                 $venice_islands = array( '30121','30122','30123','30124','30125','30126','30132','30133','30141','80073','80074','80075','80076','80077' ); 
                 if ( in_array( $postcode, $venice_islands ) ) {
                     $cost += (float) $this->get_option( 'rate_minor_islands' );
@@ -234,7 +352,6 @@ add_action( 'woocommerce_cart_calculate_fees', 'gls_add_cod_fee', 20, 1 );
 function gls_add_cod_fee( $cart ) {
     if ( is_admin() && ! defined( 'DOING_AJAX' ) ) return;
     
-    // Recupera il metodo di pagamento scelto (anche durante il caricamento AJAX in tempo reale)
     $chosen_payment_method = WC()->session->get( 'chosen_payment_method' );
     
     if ( isset( $_POST['payment_method'] ) ) {
@@ -246,14 +363,12 @@ function gls_add_cod_fee( $cart ) {
         }
     }
     
-    // Applica la tassa SOLO se l'ID del pagamento è 'cod' (Pagamento alla consegna)
     if ( 'cod' === $chosen_payment_method ) {
         $fee = (float) get_option( 'gls_cod_fee_amount', '5.00' );
         $cart->add_fee( 'Supplemento Contrassegno GLS', $fee, false ); 
     }
 }
 
-// Forza WooCommerce ad aggiornare i totali quando l'utente cambia metodo di pagamento
 add_action( 'wp_footer', 'gls_force_checkout_update' );
 function gls_force_checkout_update() {
     if ( is_checkout() && ! is_wc_endpoint_url() ) {
