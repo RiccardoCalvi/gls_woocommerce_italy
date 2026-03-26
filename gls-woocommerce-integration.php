@@ -229,13 +229,42 @@ function add_gls_custom_shipping_method( $methods ) {
     $methods['gls_contract_shipping'] = 'WC_GLS_Contract_Shipping_Method'; return $methods;
 }
 
-// --- CALCOLO SOVRATASSA CONTRASSEGNO NEL CARRELLO ---
+// --- CALCOLO SOVRATASSA CONTRASSEGNO NEL CARRELLO (AGGIORNATO) ---
 add_action( 'woocommerce_cart_calculate_fees', 'gls_add_cod_fee', 20, 1 );
 function gls_add_cod_fee( $cart ) {
     if ( is_admin() && ! defined( 'DOING_AJAX' ) ) return;
     
-    if ( 'cod' === WC()->session->get( 'chosen_payment_method' ) ) {
+    // Recupera il metodo di pagamento scelto (anche durante il caricamento AJAX in tempo reale)
+    $chosen_payment_method = WC()->session->get( 'chosen_payment_method' );
+    
+    if ( isset( $_POST['payment_method'] ) ) {
+        $chosen_payment_method = wc_clean( wp_unslash( $_POST['payment_method'] ) );
+    } elseif ( isset( $_POST['post_data'] ) ) {
+        parse_str( wc_clean( wp_unslash( $_POST['post_data'] ) ), $post_data );
+        if ( isset( $post_data['payment_method'] ) ) {
+            $chosen_payment_method = $post_data['payment_method'];
+        }
+    }
+    
+    // Applica la tassa SOLO se l'ID del pagamento è 'cod' (Pagamento alla consegna)
+    if ( 'cod' === $chosen_payment_method ) {
         $fee = (float) get_option( 'gls_cod_fee_amount', '5.00' );
         $cart->add_fee( 'Supplemento Contrassegno GLS', $fee, false ); 
+    }
+}
+
+// Forza WooCommerce ad aggiornare i totali quando l'utente cambia metodo di pagamento
+add_action( 'wp_footer', 'gls_force_checkout_update' );
+function gls_force_checkout_update() {
+    if ( is_checkout() && ! is_wc_endpoint_url() ) {
+        ?>
+        <script type="text/javascript">
+            jQuery( function( $ ) {
+                $( 'form.checkout' ).on( 'change', 'input[name="payment_method"]', function() {
+                    $( document.body ).trigger( 'update_checkout' );
+                });
+            });
+        </script>
+        <?php
     }
 }
