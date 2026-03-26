@@ -200,8 +200,12 @@ class GLS_WooCommerce_Integration_Advanced {
         $this->parse_gls_response( $body, $order );
     }
 
-    private function build_add_parcel_xml( $order ) {
-        $sede = get_option( 'gls_sede' ); $cliente = get_option( 'gls_codice_cliente' ); $password = get_option( 'gls_password' );
+   private function build_add_parcel_xml( $order ) {
+        $sede = get_option( 'gls_sede' ); 
+        $cliente = get_option( 'gls_codice_cliente' ); 
+        $password = get_option( 'gls_password' );
+        $contratto = get_option( 'gls_codice_contratto' ); // <-- Ripristinato il recupero del contratto!
+
         if ( empty( $sede ) || empty( $cliente ) || empty( $password ) ) return false;
 
         $ragione_sociale = $order->get_shipping_company() ?: $order->get_shipping_first_name() . ' ' . $order->get_shipping_last_name();
@@ -211,6 +215,12 @@ class GLS_WooCommerce_Integration_Advanced {
 
         $xml = '<?xml version="1.0" encoding="utf-8"?><Info>';
         $xml .= '<SedeGls>' . esc_html( $sede ) . '</SedeGls><CodiceClienteGls>' . esc_html( $cliente ) . '</CodiceClienteGls><PasswordClienteGls>' . esc_html( $password ) . '</PasswordClienteGls><AddParcelResult>S</AddParcelResult><Parcel>';
+        
+        // <-- Ripristinato l'inserimento del contratto nell'XML
+        if ( ! empty( $contratto ) ) {
+            $xml .= '<CodiceContrattoGls>' . esc_html( $contratto ) . '</CodiceContrattoGls>';
+        }
+        
         $xml .= '<RagioneSociale><![CDATA[' . substr( $ragione_sociale, 0, 35 ) . ']]></RagioneSociale>';
         $xml .= '<Indirizzo><![CDATA[' . substr( $indirizzo, 0, 35 ) . ']]></Indirizzo>';
         $xml .= '<Localita><![CDATA[' . substr( $order->get_shipping_city(), 0, 30 ) . ']]></Localita>';
@@ -227,12 +237,18 @@ class GLS_WooCommerce_Integration_Advanced {
     private function parse_gls_response( $xml_response, $order ) {
         $xml = @simplexml_load_string( $xml_response );
         if ( $xml === false ) {
-            $order->add_order_note( 'GLS Error: Risposta XML dal server incomprensibile. Log dati: ' . esc_html( substr($xml_response, 0, 200) ) );
+            $order->add_order_note( 'GLS Error: Risposta XML dal server incomprensibile.' );
             return;
         }
 
         if ( isset( $xml->Parcel->DescrizioneErrore ) && !empty( (string) $xml->Parcel->DescrizioneErrore ) ) {
             $order->add_order_note( 'Errore GLS (API): ' . (string) $xml->Parcel->DescrizioneErrore ); 
+            return;
+        }
+        
+        // <-- Nuovo controllo per intercettare l'errore che abbiamo appena scoperto dal tuo log
+        if ( isset( $xml->Parcel->NoteSpedizione ) && strpos( (string) $xml->Parcel->NoteSpedizione, 'Dati non accettabili' ) !== false ) {
+            $order->add_order_note( 'Errore GLS (Dati non validi): ' . (string) $xml->Parcel->NoteSpedizione ); 
             return;
         }
 
@@ -248,7 +264,7 @@ class GLS_WooCommerce_Integration_Advanced {
             }
             $order->add_order_note( $note );
         } else {
-            $order->add_order_note( 'GLS Info: Risposta completata ma nessun tracking trovato. Struttura: ' . print_r($xml, true) );
+            $order->add_order_note( 'GLS Info: Nessun tracking trovato. Struttura: ' . print_r($xml, true) );
         }
     }
 
