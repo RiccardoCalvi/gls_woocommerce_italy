@@ -3,12 +3,30 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.3.1
+ * Version: 1.3.2
  * Author: Dream2Dev
  * Requires at least: 5.8
  * Tested up to: 6.7
  * WC requires at least: 7.0
  * WC tested up to: 9.6
+ *
+ * Changelog v1.3.2:
+ *   - Fix DeleteSped "Sigla sede non specificata": la causa era il root element
+ *     dell'XML. La doc MU162 §5.4 mostra <DeleteSped> come root, ma l'endpoint
+ *     .asmx/DeleteSped via HTTP POST wrappa già il parametro nella struttura
+ *     del metodo. Con <DeleteSped> come root si otteneva doppio nesting:
+ *       <DeleteSped><DeleteSped><SedeGls>...</SedeGls>...</DeleteSped></DeleteSped>
+ *     e il server cercava <SedeGls> al primo livello, trovando <DeleteSped>.
+ *     Per AddParcel e CloseWorkDay il root è <Info> (diverso dal nome metodo),
+ *     quindi non c'è conflitto.
+ *   - Implementata strategia a 2 varianti XML: il plugin prova automaticamente
+ *     sia root <Info> (coerente con AddParcel/CloseWorkDay) sia root <DeleteSped>
+ *     (come da documentazione). Se la prima variante restituisce "sede non
+ *     specificata", passa alla seconda. Per ogni variante prova i parametri HTTP.
+ *   - Smart retry: se una combinazione parametro+variante restituisce HTTP 200
+ *     con errore "sede non specificata", il plugin riconosce che il parametro è
+ *     corretto ma l'XML root è sbagliato → prova la variante successiva con lo
+ *     stesso parametro, senza ripetere tentativi inutili.
  *
  * Changelog v1.3.1:
  *   - Fix DeleteSped HTTP 500: riscritto completamente il metodo cancel_gls_shipment
@@ -1155,71 +1173,126 @@ class GLS_WooCommerce_Integration_Advanced {
             return;
         }
 
-        // Costruisce l'XML per DeleteSped (Ref: MU162 §5.4)
-        // La struttura root è <DeleteSped>, NON <Info> come per AddParcel/CloseWorkDay.
-        $xml  = '<DeleteSped>';
-        $xml .= '<SedeGls>' . esc_html( $sede ) . '</SedeGls>';
-        $xml .= '<CodiceClienteGls>' . esc_html( $cliente ) . '</CodiceClienteGls>';
-        $xml .= '<PasswordClienteGls>' . esc_html( $password ) . '</PasswordClienteGls>';
-        $xml .= '<NumSpedizione>' . esc_html( $tracking ) . '</NumSpedizione>';
-        $xml .= '</DeleteSped>';
+        // Tag XML interni (credenziali + numero spedizione) — comuni a tutte le varianti
+        $xml_inner  = '<SedeGls>' . esc_html( $sede ) . '</SedeGls>';
+        $xml_inner .= '<CodiceClienteGls>' . esc_html( $cliente ) . '</CodiceClienteGls>';
+        $xml_inner .= '<PasswordClienteGls>' . esc_html( $password ) . '</PasswordClienteGls>';
+        $xml_inner .= '<NumSpedizione>' . esc_html( $tracking ) . '</NumSpedizione>';
 
         // Log di debug in error_log (password mascherata)
-        $xml_log = str_replace( esc_html( $password ), '***', $xml );
-        error_log( 'GLS DeleteSped XML order #' . $order_id . ': ' . $xml_log );
+        $xml_inner_log = str_replace( esc_html( $password ), '***', $xml_inner );
+        error_log( 'GLS DeleteSped order #' . $order_id . ' inner XML: ' . $xml_inner_log );
 
-        // --- LIVELLO 1: HTTP POST form-encoded con nomi parametro multipli ---
-        // La doc MU162 non specifica il parametro per DeleteSped.
-        // Proviamo i nomi più probabili basandoci sul pattern:
-        //   AddParcel → XMLInfoParcel
-        //   CloseWorkDay → XMLInfo
-        //   DeleteSped → XMLInfoSped (probabile) / XMLInfo (fallback)
+        // =================================================================
+        // STRATEGIA DI CHIAMATA (Ref: MU162 §5.4)
+        //
+        // PROBLEMA PRINCIPALE RISOLTO IN v1.3.2:
+        // La documentazione mostra <DeleteSped> come root element dell'XML,
+        // ma l'endpoint .asmx/DeleteSped via HTTP POST wrappa GIÀ il
+        // parametro nella struttura del metodo. Se anche il valore XML
+        // contiene <DeleteSped> come root, il server vede:
+        //   <DeleteSped><DeleteSped><SedeGls>...</DeleteSped></DeleteSped>
+        // e cerca <SedeGls> al primo livello, trovando <DeleteSped>.
+        // Risultato: "Sigla sede non specificata."
+        //
+        // Per AddParcel e CloseWorkDay il root element è <Info> (diverso
+        // dal nome del metodo), quindi non c'è conflitto. Per DeleteSped
+        // il root MOSTRATO nella doc è uguale al nome metodo → conflitto.
+        //
+        // Proviamo 2 varianti di root element:
+        //   Variante A: <Info>...</Info>   (come AddParcel/CloseWorkDay)
+        //   Variante B: <DeleteSped>...</DeleteSped> (come da doc MU162 §5.4)
+        //
+        // Per ogni variante, proviamo i nomi parametro HTTP POST probabili.
+        // =================================================================
+
+        $xml_variants = array(
+            // Variante A: root <Info> — coerente con AddParcel/CloseWorkDay
+            'Info'       => '<Info>' . $xml_inner . '</Info>',
+            // Variante B: root <DeleteSped> — come mostrato nella doc MU162 §5.4
+            'DeleteSped' => '<DeleteSped>' . $xml_inner . '</DeleteSped>',
+        );
+
+        // Nomi parametro da tentare per ogni variante XML
+        $param_names = array( 'XMLInfoSped', 'XMLInfo' );
+
         $http_post_success = false;
-        $param_names       = array( 'XMLInfoSped', 'XMLInfo', 'XMLInfoDelete' );
         $http_code         = 0;
         $body              = '';
+        $found_sede_error  = false;
 
-        foreach ( $param_names as $param_name ) {
-            $response = wp_remote_post( $this->api_url_deletesped, array(
-                'method'  => 'POST',
-                'timeout' => 30,
-                'body'    => array( $param_name => $xml ),
-            ) );
+        foreach ( $xml_variants as $variant_name => $xml ) {
+            foreach ( $param_names as $param_name ) {
+                $response = wp_remote_post( $this->api_url_deletesped, array(
+                    'method'  => 'POST',
+                    'timeout' => 30,
+                    'body'    => array( $param_name => $xml ),
+                ) );
 
-            if ( is_wp_error( $response ) ) {
-                error_log( 'GLS DeleteSped network error param="' . $param_name . '" order #' . $order_id . ': ' . $response->get_error_message() );
-                continue; // Prova il prossimo parametro
-            }
+                if ( is_wp_error( $response ) ) {
+                    error_log( 'GLS DeleteSped network error variant="' . $variant_name . '" param="' . $param_name . '" order #' . $order_id . ': ' . $response->get_error_message() );
+                    continue;
+                }
 
-            $http_code = wp_remote_retrieve_response_code( $response );
-            $body      = wp_remote_retrieve_body( $response );
+                $http_code = wp_remote_retrieve_response_code( $response );
+                $body      = wp_remote_retrieve_body( $response );
 
-            error_log( 'GLS DeleteSped HTTP POST param="' . $param_name . '" HTTP ' . $http_code . ' order #' . $order_id . ': ' . substr( $body, 0, 300 ) );
+                error_log( 'GLS DeleteSped variant="' . $variant_name . '" param="' . $param_name . '" HTTP ' . $http_code . ' order #' . $order_id . ': ' . substr( $body, 0, 400 ) );
 
-            // Se non è un 500 (errore server = parametro errato), abbiamo trovato il parametro giusto
-            if ( $http_code !== 500 ) {
+                // HTTP 500 = parametro POST errato, proviamo il successivo
+                if ( $http_code === 500 ) {
+                    continue;
+                }
+
+                // HTTP 200 ma con errore "Sigla sede non specificata" = XML root errato.
+                // Il server ha ricevuto la richiesta ma non trova SedeGls al livello atteso.
+                // Proviamo la variante XML successiva con lo STESSO parametro funzionante.
+                if ( $http_code === 200 ) {
+                    $body_text = $this->extract_asmx_response( $body );
+                    $body_lower = strtolower( $body_text );
+
+                    if ( strpos( $body_lower, 'sede non specificata' ) !== false
+                      || strpos( $body_lower, 'sede non valida' ) !== false ) {
+                        error_log( 'GLS DeleteSped: variante "' . $variant_name . '" respinta per XML root errato. Provo la prossima variante.' );
+                        $found_sede_error = true;
+                        // Interrompi il loop parametri, passa alla prossima variante XML
+                        break;
+                    }
+
+                    // Risposta OK o altro errore GLS gestibile → successo della chiamata
+                    $http_post_success = true;
+                    break 2; // Esce da entrambi i loop
+                }
+
+                // Qualsiasi altro HTTP code (4xx, ecc.) → usciamo con questo risultato
                 $http_post_success = true;
-                break;
+                break 2;
             }
         }
 
         // --- LIVELLO 2: SOAP 1.1 fallback ---
-        // Se tutti i tentativi HTTP POST restituiscono 500, è probabile che:
-        // (a) Il metodo non è esposto via HTTP POST form-encoded, oppure
-        // (b) Il nome del parametro non è tra quelli provati.
-        // SOAP 1.1 bypassa il problema: il parametro è definito nel WSDL.
-        // L'endpoint SOAP è l'URL base senza /MethodName.
-        if ( ! $http_post_success && $http_code === 500 ) {
-            error_log( 'GLS DeleteSped: tutti i tentativi HTTP POST falliti con 500. Provo SOAP 1.1...' );
+        // Se nessuna combinazione HTTP POST ha funzionato, proviamo SOAP.
+        if ( ! $http_post_success ) {
+            error_log( 'GLS DeleteSped: tutti i tentativi HTTP POST falliti. Provo SOAP 1.1...' );
 
-            $soap_result = $this->delete_sped_soap( $xml, $order_id );
+            // Prova SOAP con entrambe le varianti XML
+            foreach ( $xml_variants as $variant_name => $xml ) {
+                $soap_result = $this->delete_sped_soap( $xml, $order_id );
 
-            if ( $soap_result !== false ) {
-                $http_code = $soap_result['http_code'];
-                $body      = $soap_result['body'];
-                $http_post_success = ( $http_code === 200 );
+                if ( $soap_result !== false ) {
+                    $http_code = $soap_result['http_code'];
+                    $body      = $soap_result['body'];
 
-                error_log( 'GLS DeleteSped SOAP HTTP ' . $http_code . ' order #' . $order_id . ': ' . substr( $body, 0, 300 ) );
+                    error_log( 'GLS DeleteSped SOAP variant="' . $variant_name . '" HTTP ' . $http_code . ' order #' . $order_id . ': ' . substr( $body, 0, 300 ) );
+
+                    if ( $http_code === 200 ) {
+                        $body_lower = strtolower( $body );
+                        if ( strpos( $body_lower, 'sede non specificata' ) === false ) {
+                            $http_post_success = true;
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -1238,14 +1311,12 @@ class GLS_WooCommerce_Integration_Advanced {
                 '⚠️ GLS: Il server ha restituito HTTP 500 durante la cancellazione della spedizione ' . $tracking . '. '
                 . 'Tutti i metodi di chiamata (HTTP POST e SOAP) hanno fallito. '
                 . 'Possibili cause: (1) la funzione DeleteSped non è abilitata per questo account GLS, '
-                . '(2) l\'ambiente di test GLS non espone il metodo DeleteSped, '
-                . '(3) la spedizione non è cancellabile da webservice. '
+                . '(2) l\'ambiente di test GLS non espone il metodo DeleteSped. '
                 . 'Contatta la sede GLS per procedere manualmente alla cancellazione. '
                 . 'Il tracking è stato rimosso dall\'ordine.'
             );
-            // Rimuove comunque il tracking dall'ordine per evitare doppi tentativi (HPOS-compatible)
             $this->delete_order_meta( $order, array( '_gls_tracking_number', 'gls_tracking_number', '_gls_label_pdf_url' ) );
-            error_log( 'GLS DeleteSped HTTP 500 persistente (POST+SOAP) order #' . $order_id . ': ' . substr( $body, 0, 500 ) );
+            error_log( 'GLS DeleteSped HTTP 500 persistente order #' . $order_id . ': ' . substr( $body, 0, 500 ) );
             return;
         }
 
