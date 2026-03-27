@@ -3,8 +3,18 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.2.0
+ * Version: 1.2.1
  * Author: Dream2Dev
+ *
+ * Changelog v1.2.1:
+ *   - Fix DeleteSped: il nome del parametro POST è ora tentato in sequenza come "XMLInfo" e poi
+ *     "XMLInfoSped" (la doc MU162 §5.4 non specifica il nome esatto del parametro HTTP, a differenza
+ *     di AddParcel che usa "XMLInfoParcel" e CloseWorkDay che usa "XMLInfo").
+ *   - Fix DeleteSped: gestione esplicita HTTP 500 — in ambiente di test GLS il metodo DeleteSped
+ *     potrebbe non essere esposto, generando un 500 server-side non dipendente dal codice.
+ *     Il log della risposta raw del 500 viene ora scritto in error_log per diagnosi.
+ *   - Fix DeleteSped: aggiunto log in error_log dell'XML inviato (con password mascherata)
+ *     per facilitare il debug senza esporre dati nelle note ordine.
  *
  * Changelog v1.2.0:
  *   - Nuova funzione: cancellazione spedizione GLS (DeleteSped) al cambio stato ordine → "Annullato"
@@ -885,35 +895,78 @@ class GLS_WooCommerce_Integration_Advanced {
         }
 
         // Costruisce l'XML per DeleteSped (Ref: MU162 §5.4)
-        // La struttura root è <DeleteSped>, NON <Info> come per AddParcel/CloseWorkDay
+        // La struttura root è <DeleteSped>, NON <Info> come per AddParcel/CloseWorkDay.
+        // NumSpedizione: il numero di tracking GLS restituito da AddParcel.
         $xml  = '<DeleteSped>';
         $xml .= '<SedeGls>' . esc_html( $sede ) . '</SedeGls>';
         $xml .= '<CodiceClienteGls>' . esc_html( $cliente ) . '</CodiceClienteGls>';
         $xml .= '<PasswordClienteGls>' . esc_html( $password ) . '</PasswordClienteGls>';
-        // NumSpedizione: il numero di spedizione GLS (senza sigla sede)
         $xml .= '<NumSpedizione>' . esc_html( $tracking ) . '</NumSpedizione>';
         $xml .= '</DeleteSped>';
 
-        // Invio richiesta HTTP POST all'endpoint DeleteSped
-        $response = wp_remote_post( $this->api_url_deletesped, array(
-            'method'  => 'POST',
-            'timeout' => 30,
-            'body'    => array( 'XMLInfo' => $xml ),
-        ) );
+        // Log di debug in error_log (password mascherata) per facilitare diagnosi
+        $xml_log = str_replace( esc_html( $password ), '***', $xml );
+        error_log( 'GLS DeleteSped XML sent order #' . $order_id . ': ' . $xml_log );
 
-        if ( is_wp_error( $response ) ) {
-            $order->add_order_note( 'GLS Error di rete durante la cancellazione spedizione ' . $tracking . ': ' . $response->get_error_message() . '. Contatta manualmente la sede GLS.' );
-            error_log( 'GLS DeleteSped network error order #' . $order_id . ': ' . $response->get_error_message() );
+        // NOTA: la documentazione MU162 §5.4 non specifica esplicitamente il nome del
+        // parametro HTTP POST per DeleteSped (a differenza di AddParcel → "XMLInfoParcel"
+        // e CloseWorkDay → "XMLInfo"). Proviamo prima con "XMLInfo" (pattern più comune),
+        // poi con "XMLInfoSped" come fallback in caso di HTTP 500/errore.
+        $param_names = array( 'XMLInfo', 'XMLInfoSped' );
+        $response    = null;
+        $http_code   = 0;
+        $body        = '';
+
+        foreach ( $param_names as $param_name ) {
+            $response = wp_remote_post( $this->api_url_deletesped, array(
+                'method'  => 'POST',
+                'timeout' => 30,
+                'body'    => array( $param_name => $xml ),
+            ) );
+
+            if ( is_wp_error( $response ) ) {
+                $order->add_order_note(
+                    'GLS Error di rete durante la cancellazione spedizione ' . $tracking . ': '
+                    . $response->get_error_message() . '. Contatta manualmente la sede GLS.'
+                );
+                error_log( 'GLS DeleteSped network error order #' . $order_id . ': ' . $response->get_error_message() );
+                return;
+            }
+
+            $http_code = wp_remote_retrieve_response_code( $response );
+            $body      = wp_remote_retrieve_body( $response );
+
+            error_log( 'GLS DeleteSped param="' . $param_name . '" HTTP ' . $http_code . ' order #' . $order_id . ': ' . substr( $body, 0, 300 ) );
+
+            // Se la risposta non è un 500 server error, usiamo questa risposta
+            if ( $http_code !== 500 ) {
+                break;
+            }
+        }
+
+        // Gestione HTTP 500: può dipendere da:
+        // 1) Nome parametro POST errato (il server non trova il metodo)
+        // 2) Ambiente di test GLS che non espone DeleteSped
+        // 3) Errore lato server GLS (transitorio)
+        if ( $http_code === 500 ) {
+            $order->add_order_note(
+                '⚠️ GLS: Il server ha restituito HTTP 500 durante la cancellazione della spedizione ' . $tracking . '. '
+                . 'Possibili cause: (1) la funzione DeleteSped non è abilitata per questo account, '
+                . '(2) si sta usando un\'etichetta di test non cancellabile via webservice. '
+                . 'Contatta la sede GLS per procedere manualmente. '
+                . 'Il tracking è stato rimosso dall\'ordine.'
+            );
+            // Rimuove comunque il tracking per evitare doppi tentativi
+            delete_post_meta( $order->get_id(), '_gls_tracking_number' );
+            delete_post_meta( $order->get_id(), '_gls_label_pdf_url' );
+            error_log( 'GLS DeleteSped HTTP 500 body order #' . $order_id . ': ' . substr( $body, 0, 500 ) );
             return;
         }
 
-        $http_code = wp_remote_retrieve_response_code( $response );
-        $body      = wp_remote_retrieve_body( $response );
-
-        error_log( 'GLS DeleteSped response order #' . $order_id . ' tracking ' . $tracking . ': ' . substr( $body, 0, 500 ) );
-
-        if ( $http_code != 200 ) {
-            $order->add_order_note( 'GLS HTTP Error ' . $http_code . ' durante la cancellazione spedizione ' . $tracking . '. Contatta manualmente la sede GLS.' );
+        if ( $http_code !== 200 ) {
+            $order->add_order_note(
+                'GLS HTTP Error ' . $http_code . ' durante la cancellazione spedizione ' . $tracking . '. Contatta manualmente la sede GLS.'
+            );
             return;
         }
 
