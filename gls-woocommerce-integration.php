@@ -3,8 +3,17 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.2.1
+ * Version: 1.2.2
  * Author: Dream2Dev
+ *
+ * Changelog v1.2.2:
+ *   - Fix shortcode [gls_tracking_number]: lo shortcode non funzionava nelle email WooCommerce
+ *     perché $post globale è null durante il rendering email. Ora l'ordine corrente viene
+ *     catturato tramite l'hook woocommerce_email_before_order_table (che riceve l'oggetto
+ *     $order direttamente) e salvato in una proprietà statica di classe prima del rendering.
+ *   - Nuovo: blocco tracking GLS nella pagina "Visualizza ordine" dell'account cliente
+ *     tramite hook woocommerce_order_details_after_order_table — mostra tracking e link
+ *     GLS solo se il numero di spedizione è presente nei metadati dell'ordine.
  *
  * Changelog v1.2.1:
  *   - Fix DeleteSped: il nome del parametro POST è ora tentato in sequenza come "XMLInfo" e poi
@@ -218,6 +227,19 @@ class GLS_WooCommerce_Integration_Advanced {
     private $api_url_deletesped = 'https://labelservice.gls-italy.com/ilswebservice.asmx/DeleteSped';
 
     /**
+     * Proprietà statica per trasmettere l'ID ordine corrente allo shortcode
+     * durante il rendering delle email WooCommerce.
+     *
+     * Il problema: WooCommerce genera le email fuori dal loop di WordPress,
+     * quindi $post è null e lo shortcode non riesce a risalire all'ordine.
+     * Soluzione: l'hook woocommerce_email_before_order_table riceve $order
+     * come argomento diretto → salviamo l'ID qui prima che l'email venga renderizzata.
+     *
+     * @var int|null
+     */
+    private static $current_email_order_id = null;
+
+    /**
      * Costruttore: registra tutti gli hook WordPress/WooCommerce necessari.
      */
     public function __construct() {
@@ -244,6 +266,15 @@ class GLS_WooCommerce_Integration_Advanced {
 
         // Shortcode per mostrare il tracking number nelle email al cliente
         add_shortcode( 'gls_tracking_number', array( $this, 'tracking_number_shortcode' ) );
+
+        // Hook per catturare l'ordine corrente PRIMA del rendering dell'email.
+        // Necessario perché $post è null nelle email WooCommerce.
+        // woocommerce_email_before_order_table riceve ($order, $sent_to_admin, $plain_text, $email)
+        add_action( 'woocommerce_email_before_order_table', array( $this, 'capture_email_order_id' ), 1, 1 );
+
+        // Mostra il blocco tracking GLS nella pagina "Visualizza ordine" dell'account cliente
+        // hook: woocommerce_order_details_after_order_table — riceve $order come argomento
+        add_action( 'woocommerce_order_details_after_order_table', array( $this, 'display_tracking_on_order_page' ), 10, 1 );
     }
 
     /**
@@ -779,48 +810,69 @@ class GLS_WooCommerce_Integration_Advanced {
     }
 
     // ========================================================================
-    // SHORTCODE TRACKING NUMBER
-    // Da usare nei template email WooCommerce per inviare il tracking al cliente.
+    // SHORTCODE TRACKING NUMBER + INTEGRAZIONE EMAIL + PAGINA ORDINE CLIENTE
     // ========================================================================
+
+    /**
+     * Hook: cattura l'ID ordine corrente prima del rendering dell'email WooCommerce.
+     *
+     * WooCommerce renderizza le email fuori dal loop di WordPress: $post è null
+     * e lo shortcode non può risalire all'ordine. Questo metodo viene chiamato
+     * dall'hook woocommerce_email_before_order_table (che riceve $order come primo
+     * argomento) e salva l'ID in una proprietà statica accessibile dallo shortcode.
+     *
+     * @param WC_Order $order Oggetto ordine passato dal sistema email WooCommerce
+     */
+    public function capture_email_order_id( $order ) {
+        if ( $order instanceof WC_Order ) {
+            self::$current_email_order_id = $order->get_id();
+        }
+    }
 
     /**
      * Shortcode [gls_tracking_number] per i template email WooCommerce.
      *
-     * Uso nei template email:
+     * COME USARLO nei template email WooCommerce (es. "Ordine completato"):
      *   Il tuo codice di tracciamento: [gls_tracking_number]
+     *   Traccia la tua spedizione: [gls_tracking_number link="yes"]
+     *   Stato spedizione: [gls_tracking_number fallback="In preparazione"]
      *
-     * Attributi disponibili:
-     *   [gls_tracking_number order_id="123"]       — specifica un ordine esplicito
-     *   [gls_tracking_number link="yes"]            — avvolge il tracking in un link GLS
-     *   [gls_tracking_number fallback="In preparazione"] — testo se tracking non disponibile
+     * Attributi:
+     *   order_id  — ID ordine esplicito (opzionale, di solito non serve)
+     *   link      — "yes" (default) avvolge il codice in un link GLS, "no" restituisce solo testo
+     *   fallback  — testo mostrato se il tracking non è ancora disponibile (default: stringa vuota)
      *
-     * WooCommerce passa automaticamente l'ID dell'ordine corrente tramite
-     * il filtro "woocommerce_email_order_id" durante il rendering delle email.
-     * In assenza di quell'hook, lo shortcode tenta di recuperare l'ordine
-     * dal contesto globale $post.
+     * Risoluzione dell'ordine (in ordine di priorità):
+     *   1. Attributo order_id esplicito
+     *   2. self::$current_email_order_id (popolato dall'hook woocommerce_email_before_order_table)
+     *   3. $post globale (funziona nella pagina ordine del backend, non nelle email)
      *
      * @param array $atts Attributi dello shortcode
-     * @return string Tracking number (con o senza link) o stringa vuota/fallback
+     * @return string HTML del tracking o stringa fallback
      */
     public function tracking_number_shortcode( $atts ) {
         $atts = shortcode_atts(
             array(
-                'order_id' => 0,        // ID ordine esplicito (opzionale)
-                'link'     => 'yes',    // "yes" per avvolgere in link GLS, "no" per solo testo
-                'fallback' => '',       // Testo da mostrare se tracking non disponibile
+                'order_id' => 0,
+                'link'     => 'yes',
+                'fallback' => '',
             ),
             $atts,
             'gls_tracking_number'
         );
 
-        // Recupera l'ID ordine: prima dall'attributo, poi dal contesto globale
+        // 1. Attributo esplicito
         $order_id = (int) $atts['order_id'];
+
+        // 2. Ordine catturato dall'hook email (risolve il problema del $post null)
+        if ( ! $order_id && self::$current_email_order_id ) {
+            $order_id = self::$current_email_order_id;
+        }
+
+        // 3. Fallback: $post globale (solo per contesti diversi dalle email)
         if ( ! $order_id ) {
-            // Nei template email WooCommerce, l'ordine corrente è spesso
-            // disponibile tramite il filtro woocommerce_email_order_id
-            // oppure tramite il post globale durante il rendering
             global $post;
-            if ( $post && $post->post_type === 'shop_order' ) {
+            if ( $post && in_array( $post->post_type, array( 'shop_order', 'wc_order' ), true ) ) {
                 $order_id = $post->ID;
             }
         }
@@ -829,20 +881,66 @@ class GLS_WooCommerce_Integration_Advanced {
             return esc_html( $atts['fallback'] );
         }
 
-        // Recupera il tracking number dai metadati dell'ordine
         $tracking = get_post_meta( $order_id, '_gls_tracking_number', true );
 
         if ( empty( $tracking ) ) {
             return esc_html( $atts['fallback'] );
         }
 
-        // Formato output: link cliccabile o solo testo
         if ( $atts['link'] === 'yes' ) {
             $tracking_url = 'https://gls-group.eu/track/' . urlencode( $tracking );
-            return '<a href="' . esc_url( $tracking_url ) . '" target="_blank">' . esc_html( $tracking ) . '</a>';
+            return '<a href="' . esc_url( $tracking_url ) . '" target="_blank" style="color:#e2001a;font-weight:bold;">'
+                . esc_html( $tracking )
+                . '</a>';
         }
 
         return esc_html( $tracking );
+    }
+
+    /**
+     * Mostra il blocco di tracking GLS nella pagina "Visualizza ordine" dell'account cliente.
+     *
+     * Agganciato all'hook woocommerce_order_details_after_order_table che viene eseguito
+     * nelle pagine: /account/visualizza-ordine/{id}/ e nell'email riepilogo ordine.
+     * Mostra il blocco solo se il numero di spedizione GLS è presente nei metadati.
+     *
+     * @param WC_Order $order Oggetto ordine corrente
+     */
+    public function display_tracking_on_order_page( $order ) {
+        if ( ! $order instanceof WC_Order ) {
+            return;
+        }
+
+        $tracking = get_post_meta( $order->get_id(), '_gls_tracking_number', true );
+
+        if ( empty( $tracking ) ) {
+            return;
+        }
+
+        $tracking_url = 'https://gls-group.eu/track/' . urlencode( $tracking );
+        ?>
+        <section class="woocommerce-gls-tracking" style="margin-top:2em; padding:1em 1.5em; background:#f8f8f8; border-left:4px solid #e2001a;">
+            <h2 style="font-size:1em; margin:0 0 0.5em; color:#333;">
+                <?php esc_html_e( 'Informazioni di Spedizione GLS', 'woocommerce' ); ?>
+            </h2>
+            <p style="margin:0; font-size:0.95em; color:#555;">
+                <?php esc_html_e( 'Il tuo pacco è in consegna con GLS. Usa il codice qui sotto per tracciare la spedizione:', 'woocommerce' ); ?>
+            </p>
+            <p style="margin:0.75em 0 0;">
+                <strong><?php esc_html_e( 'Codice di tracking:', 'woocommerce' ); ?></strong>
+                &nbsp;
+                <a href="<?php echo esc_url( $tracking_url ); ?>" target="_blank" rel="noopener noreferrer"
+                   style="color:#e2001a; font-weight:bold; font-size:1.1em;">
+                    <?php echo esc_html( $tracking ); ?>
+                </a>
+                &nbsp;
+                <a href="<?php echo esc_url( $tracking_url ); ?>" target="_blank" rel="noopener noreferrer"
+                   style="display:inline-block; margin-left:0.5em; padding:0.3em 0.8em; background:#e2001a; color:#fff; border-radius:3px; text-decoration:none; font-size:0.85em;">
+                    <?php esc_html_e( 'Traccia spedizione →', 'woocommerce' ); ?>
+                </a>
+            </p>
+        </section>
+        <?php
     }
 
     // ========================================================================
