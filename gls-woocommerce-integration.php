@@ -3,7 +3,7 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.0.8
+ * Version: 1.0.9
  * Author: Dream2Dev
  */
 
@@ -94,7 +94,6 @@ class GLS_WooCommerce_Integration_Advanced {
     public function __construct() {
         add_action( 'woocommerce_order_status_processing', array( $this, 'generate_gls_shipment' ), 10, 1 );
         
-        // Azione manuale nell'ordine
         add_action( 'woocommerce_order_actions', array( $this, 'add_gls_order_action' ) );
         add_action( 'woocommerce_order_action_gls_generate_label', array( $this, 'process_gls_order_action' ) );
 
@@ -123,8 +122,10 @@ class GLS_WooCommerce_Integration_Advanced {
         register_setting( 'gls_settings_group', 'gls_codice_cliente' );
         register_setting( 'gls_settings_group', 'gls_password' );
         register_setting( 'gls_settings_group', 'gls_codice_contratto' );
+        
         register_setting( 'gls_settings_group', 'gls_vat_rate' );
-        register_setting( 'gls_settings_group', 'gls_free_shipping_threshold' ); // Nuovo parametro
+        register_setting( 'gls_settings_group', 'gls_free_shipping_threshold' );
+        
         register_setting( 'gls_settings_group', 'gls_enable_cod' );
         register_setting( 'gls_settings_group', 'gls_cod_fee_percentage' ); 
         register_setting( 'gls_settings_group', 'gls_cod_min_fee' ); 
@@ -138,31 +139,26 @@ class GLS_WooCommerce_Integration_Advanced {
             <form action="options.php" method="post">
                 <?php settings_fields( 'gls_settings_group' ); ?>
                 <table class="form-table">
+                    <tr><th colspan="2"><h3>Credenziali API</h3></th></tr>
                     <tr><th scope="row">Sede GLS (Sigla)</th><td><input type="text" name="gls_sede" value="<?php echo esc_attr( get_option( 'gls_sede' ) ); ?>" maxlength="2" placeholder="Es. MI" /></td></tr>
                     <tr><th scope="row">Codice Cliente</th><td><input type="text" name="gls_codice_cliente" value="<?php echo esc_attr( get_option( 'gls_codice_cliente' ) ); ?>" /></td></tr>
                     <tr><th scope="row">Password</th><td><input type="password" name="gls_password" value="<?php echo esc_attr( get_option( 'gls_password' ) ); ?>" /></td></tr>
-                    <tr><th scope="row">Codice Contratto (Obbligatorio)</th><td><input type="text" name="gls_codice_contratto" value="<?php echo esc_attr( get_option( 'gls_codice_contratto' ) ); ?>" placeholder="Es. 0000" /></td></tr>
+                    <tr><th scope="row">Codice Contratto (Obbligatorio)</th><td><input type="text" name="gls_codice_contratto" value="<?php echo esc_attr( get_option( 'gls_codice_contratto' ) ); ?>" /> <br><small>Inserisci il codice esatto fornito da GLS, senza zeri iniziali se non previsti.</small></td></tr>
                     
                     <tr><th colspan="2"><hr><h3>Impostazioni Costi e Tasse</h3></th></tr>
                     <tr>
                         <th scope="row">Aliquota IVA Spedizioni (%)</th>
-                        <td>
-                            <input type="number" step="1" name="gls_vat_rate" value="<?php echo esc_attr( get_option( 'gls_vat_rate', '22' ) ); ?>" />
-                            <br><small>Questa percentuale verrà sommata in automatico ai costi netti di spedizione e di contrassegno.</small>
-                        </td>
+                        <td><input type="number" step="1" name="gls_vat_rate" value="<?php echo esc_attr( get_option( 'gls_vat_rate', '22' ) ); ?>" /></td>
                     </tr>
                     <tr>
                         <th scope="row">Soglia Spedizione Gratuita (€)</th>
-                        <td>
-                            <input type="number" step="0.01" name="gls_free_shipping_threshold" value="<?php echo esc_attr( get_option( 'gls_free_shipping_threshold', '0' ) ); ?>" />
-                            <br><small>Imposta a 0 per disabilitare. Se il totale del carrello (tasse incluse) supera questa soglia, la spedizione sarà gratuita (il contrassegno, se scelto, verrà comunque addebitato).</small>
-                        </td>
+                        <td><input type="number" step="0.01" name="gls_free_shipping_threshold" value="<?php echo esc_attr( get_option( 'gls_free_shipping_threshold', '0' ) ); ?>" /></td>
                     </tr>
 
                     <tr><th colspan="2"><hr><h3>Impostazioni Contrassegno (COD)</h3></th></tr>
                     <tr>
                         <th scope="row">Abilita Trasmissione Contrassegno</th>
-                        <td><label><input type="checkbox" name="gls_enable_cod" value="yes" <?php checked( get_option( 'gls_enable_cod' ), 'yes' ); ?> /> Trasmetti a GLS l'incasso del contrassegno se il cliente lo sceglie al checkout.</label></td>
+                        <td><label><input type="checkbox" name="gls_enable_cod" value="yes" <?php checked( get_option( 'gls_enable_cod' ), 'yes' ); ?> /> Trasmetti a GLS l'incasso del contrassegno.</label></td>
                     </tr>
                     <tr>
                         <th scope="row">Percentuale Contrassegno (%)</th>
@@ -240,8 +236,7 @@ class GLS_WooCommerce_Integration_Advanced {
         $xml .= '<SedeGls>' . esc_html( $sede ) . '</SedeGls><CodiceClienteGls>' . esc_html( $cliente ) . '</CodiceClienteGls><PasswordClienteGls>' . esc_html( $password ) . '</PasswordClienteGls><AddParcelResult>S</AddParcelResult><Parcel>';
         
         if ( ! empty( $contratto ) || $contratto === '0' ) {
-            $contratto_padded = str_pad( trim( $contratto ), 4, '0', STR_PAD_LEFT );
-            $xml .= '<CodiceContrattoGls>' . esc_html( $contratto_padded ) . '</CodiceContrattoGls>';
+            $xml .= '<CodiceContrattoGls>' . esc_html( trim( $contratto ) ) . '</CodiceContrattoGls>';
         }
         
         $xml .= '<RagioneSociale><![CDATA[' . substr( $ragione_sociale, 0, 35 ) . ']]></RagioneSociale>';
@@ -292,7 +287,32 @@ class GLS_WooCommerce_Integration_Advanced {
 
     public function schedule_cron() { /* Cron setup */ }
     public function clear_cron() { /* Cron clear */ }
-    public function execute_close_work_day() { /* Close Work Day Logic */ }
+    
+    public function execute_close_work_day() {
+        $sede = get_option( 'gls_sede' );
+        $cliente = get_option( 'gls_codice_cliente' );
+        $password = get_option( 'gls_password' );
+
+        if ( empty( $sede ) || empty( $cliente ) || empty( $password ) ) {
+            error_log( 'GLS Cron Error: Credenziali mancanti.' );
+            return;
+        }
+
+        $xml = '<?xml version="1.0" encoding="utf-8"?><Info><SedeGls>' . esc_html( $sede ) . '</SedeGls><CodiceClienteGls>' . esc_html( $cliente ) . '</CodiceClienteGls><PasswordClienteGls>' . esc_html( $password ) . '</PasswordClienteGls><CloseWorkDayResult>S</CloseWorkDayResult></Info>';
+
+        $response = wp_remote_post( $this->api_url_closeworkday, array(
+            'method'  => 'POST',
+            'timeout' => 60,
+            'body'    => array( 'XMLInfo' => $xml )
+        ) );
+
+        if ( is_wp_error( $response ) ) {
+            error_log( 'GLS CloseWorkDay Error: ' . $response->get_error_message() );
+            return;
+        }
+        $body = wp_remote_retrieve_body( $response );
+        error_log( 'GLS CloseWorkDay Eseguito: ' . substr( $body, 0, 200 ) );
+    }
 }
 
 add_action( 'admin_post_gls_manual_close_work_day', 'gls_manual_cwd_handler' );
@@ -406,17 +426,14 @@ function gls_custom_shipping_method_init() {
                     $cost += ( ceil( $weight / 100 ) * $minor_rate );
                 }
 
-                // Applica in automatico l'IVA al costo calcolato
                 $vat_rate = (float) get_option( 'gls_vat_rate', '22' );
                 $cost_with_vat = $cost * ( 1 + ( $vat_rate / 100 ) );
 
-                // Controlla se è stata superata la soglia di spedizione gratuita
                 $free_threshold = (float) get_option( 'gls_free_shipping_threshold', '0' );
-                // Calcola il totale del carrello per i prodotti, comprensivo di IVA (inclusi eventuali sconti applicati)
                 $cart_total_for_threshold = WC()->cart->get_cart_contents_total() + WC()->cart->get_cart_contents_tax();
 
                 if ( $free_threshold > 0 && $cart_total_for_threshold >= $free_threshold ) {
-                    $cost_with_vat = 0; // Azzera il costo di spedizione
+                    $cost_with_vat = 0; 
                 }
 
                 $this->add_rate( array( 'id' => $this->id, 'label' => $this->title, 'cost' => $cost_with_vat ) );
