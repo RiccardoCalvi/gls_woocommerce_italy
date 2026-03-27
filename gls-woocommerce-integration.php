@@ -1414,8 +1414,7 @@ function gls_register_yaymail_shortcodes( $shortcode_list, $yaymail_informations
         $shortcode_list['[yaymail_custom_shortcode_gls_tracking_link]'] =
             '<a href="' . esc_url( $tracking_url ) . '" '
             . 'target="_blank" rel="noopener noreferrer" '
-            . 'style="display:inline-block;padding:8px 18px;background:#e2001a;color:#ffffff;'
-            . 'text-decoration:none;border-radius:4px;font-weight:bold;font-size:14px;">'
+            . 'style="display: inline-block; margin-left: 0.5em; padding: 15px 30px 15px 30px; background: #f2c200; color: #fff;font-size:14px;">'
             . 'Traccia la tua spedizione GLS &rarr;'
             . '</a>';
     } else {
