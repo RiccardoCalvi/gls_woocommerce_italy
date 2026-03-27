@@ -3,8 +3,37 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.2.3
+ * Version: 1.3.0
  * Author: Dream2Dev
+ * Requires at least: 5.8
+ * Tested up to: 6.7
+ * WC requires at least: 7.0
+ * WC tested up to: 9.6
+ *
+ * Changelog v1.3.0:
+ *   - HPOS (High-Performance Order Storage): piena compatibilità con il nuovo storage ordini
+ *     di WooCommerce. Tutte le chiamate get_post_meta/update_post_meta/delete_post_meta sono
+ *     state sostituite con i metodi CRUD di WC_Order ($order->get_meta(), ->update_meta_data(),
+ *     ->delete_meta_data(), ->save()). Questo risolve il problema dei metadati non visibili
+ *     nella metabox "Campi personalizzati" e nei campi meta in fondo alla pagina ordine.
+ *     Dichiarata compatibilità HPOS tramite before_woocommerce_init.
+ *   - Fix YayMail Pro: riscritto il sistema di integrazione con YayMail. I vecchi filtri
+ *     yaymail_custom_variables / yaymail_custom_variable_value NON esistono in YayMail.
+ *     Ora vengono registrati shortcode custom tramite il filtro corretto
+ *     yaymail_customs_shortcode (con la "s"), usando il prefisso obbligatorio
+ *     [yaymail_custom_shortcode_*]. Shortcode disponibili nel builder YayMail:
+ *       [yaymail_custom_shortcode_gls_tracking]     — codice tracking testuale
+ *       [yaymail_custom_shortcode_gls_tracking_link] — bottone HTML cliccabile stile GLS
+ *   - Fix: aggiunto hook woocommerce_email_order_meta_fields per iniettare il tracking
+ *     direttamente nei metadati ordine delle email WooCommerce native, come fallback
+ *     indipendente da YayMail.
+ *   - Fix: il link di tracking GLS ora punta all'URL ufficiale GLS Italy per il tracciamento
+ *     (https://www.gls-italy.com/it/servizi/servizi-per-chi-riceve/ricerca-spedizioni).
+ *   - Fix: lo shortcode [gls_tracking_number] ora funziona anche con HPOS attivo,
+ *     utilizzando wc_get_order() + get_meta() al posto di get_post_meta().
+ *   - Fix: la rigenerazione etichetta da azione ordine ora salva correttamente i meta
+ *     e questi appaiono immediatamente nella pagina dettaglio ordine.
+ *   - Rimossi i filtri YayMail errati (yaymail_custom_variables, yaymail_custom_variable_value).
  *
  * Changelog v1.2.3:
  *   - Fix email tracking: sostituito lo shortcode [gls_tracking_number] (non processato da YayMail)
@@ -29,48 +58,55 @@
  *
  * Changelog v1.2.1:
  *   - Fix DeleteSped: il nome del parametro POST è ora tentato in sequenza come "XMLInfo" e poi
- *     "XMLInfoSped" (la doc MU162 §5.4 non specifica il nome esatto del parametro HTTP, a differenza
- *     di AddParcel che usa "XMLInfoParcel" e CloseWorkDay che usa "XMLInfo").
- *   - Fix DeleteSped: gestione esplicita HTTP 500 — in ambiente di test GLS il metodo DeleteSped
- *     potrebbe non essere esposto, generando un 500 server-side non dipendente dal codice.
- *     Il log della risposta raw del 500 viene ora scritto in error_log per diagnosi.
- *   - Fix DeleteSped: aggiunto log in error_log dell'XML inviato (con password mascherata)
- *     per facilitare il debug senza esporre dati nelle note ordine.
+ *     "XMLInfoSped" (la doc MU162 §5.4 non specifica il nome esatto del parametro HTTP).
+ *   - Fix DeleteSped: gestione esplicita HTTP 500.
+ *   - Fix DeleteSped: aggiunto log in error_log dell'XML inviato (con password mascherata).
  *
  * Changelog v1.2.0:
- *   - Nuova funzione: cancellazione spedizione GLS (DeleteSped) al cambio stato ordine → "Annullato"
- *     Ref: MU162 v30, sez. 5.4 - se la spedizione è già "Chiusa" la cancellazione non blocca l'inoltro
- *     nel circuito GLS; l'utente viene avvisato tramite nota ordine.
+ *   - Nuova funzione: cancellazione spedizione GLS (DeleteSped) al cambio stato → "Annullato"
  *   - Nuova funzione: invio automatico email all'amministratore con etichetta PDF in allegato
- *     al momento della creazione della spedizione, per consentire la stampa immediata.
- *   - Nuova funzione: shortcode [gls_tracking_number] per visualizzare il codice di tracking
- *     nei template email WooCommerce inviati al cliente.
- *   - Rimossi log di debug eccessivi nelle note ordine (XML inviato, risposta raw).
- *     I log di diagnostica restano disponibili solo in error_log di sistema.
+ *   - Nuova funzione: shortcode [gls_tracking_number] per visualizzare il tracking nelle email
+ *   - Rimossi log di debug eccessivi nelle note ordine
  *
  * Changelog v1.1.1:
  *   - Fix critico parsing risposta: NumeroSpedizione viene ora controllato PRIMA di NoteSpedizione
- *   - Fix: gestione root element <InfoLabel xmlns=""> nella risposta (non <Info>)
+ *   - Fix: gestione root element <InfoLabel xmlns=""> nella risposta
  *   - Aggiunta gestione etichette GLS CHECK (routing fallito ma spedizione creata)
- *   - Aumentato log debug risposta da 300 a 2000 caratteri
- *   - Aggiunto log specifico di NumeroSpedizione, NoteSpedizione e DescrizioneSedeDestino
  *
  * Changelog v1.1.0:
- *   - Fix critico: corretti nomi tag XML per conformità con documentazione API GLS (MU162 Label Service v30)
- *   - Fix: formato decimale con virgola (es. "10,5") come richiesto dall'API GLS
- *   - Fix: parsing risposta ASMX - gestione wrapper <string xmlns="..."> del webservice
- *   - Fix: rimossa dichiarazione <?xml?> dal parametro form (non prevista dalla doc)
- *   - Aggiunto tag <GeneraPdf>4</GeneraPdf> per ricevere etichetta PDF in formato 10x15
- *   - Aggiunto tag <TipoPorto>F</TipoPorto> (Porto Franco) obbligatorio
+ *   - Fix critico: corretti nomi tag XML per conformità con documentazione API GLS (MU162 v30)
+ *   - Fix: formato decimale con virgola come richiesto dall'API GLS
+ *   - Fix: parsing risposta ASMX
+ *   - Aggiunto tag <GeneraPdf>4</GeneraPdf> per etichetta PDF 10x15
+ *   - Aggiunto tag <TipoPorto>F</TipoPorto> obbligatorio
  *   - Aggiunto tag <ModalitaIncasso>CONT</ModalitaIncasso> quando contrassegno attivo
  *   - Aggiunto tag <TipoSpedizione>N</TipoSpedizione> per spedizioni nazionali
  *   - Implementato cron CloseWorkDay con scheduling effettivo
- *   - Fix: verifica nonce nel handler manuale CloseWorkDay
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
     exit; // Impedisce l'accesso diretto al file
 }
+
+// ============================================================================
+// DICHIARAZIONE COMPATIBILITÀ HPOS (High-Performance Order Storage)
+//
+// WooCommerce 8.2+ utilizza tabelle custom (wp_wc_orders, wp_wc_orders_meta)
+// al posto di wp_posts/wp_postmeta per gli ordini. Senza questa dichiarazione,
+// WooCommerce mostra un avviso di incompatibilità nella pagina stato del sistema.
+//
+// Ref: https://developer.woocommerce.com/docs/hpos-extension-recipe-book/
+// ============================================================================
+add_action( 'before_woocommerce_init', function() {
+    if ( class_exists( \Automattic\WooCommerce\Utilities\FeaturesUtil::class ) ) {
+        \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility(
+            'custom_order_tables',
+            __FILE__,
+            true
+        );
+    }
+} );
+
 
 // ============================================================================
 // CLASSE PER AUTO-UPDATE DA GITHUB
@@ -239,6 +275,12 @@ class GLS_WooCommerce_Integration_Advanced {
     private $api_url_deletesped = 'https://labelservice.gls-italy.com/ilswebservice.asmx/DeleteSped';
 
     /**
+     * URL base per il tracking GLS Italy.
+     * Ref: sito ufficiale GLS Italy — pagina ricerca spedizioni
+     */
+    private $tracking_base_url = 'https://www.gls-italy.com/it/servizi/servizi-per-chi-riceve/ricerca-spedizioni?match=';
+
+    /**
      * Proprietà statica per trasmettere l'ID ordine corrente allo shortcode
      * durante il rendering delle email WooCommerce.
      *
@@ -281,12 +323,83 @@ class GLS_WooCommerce_Integration_Advanced {
 
         // Hook per catturare l'ordine corrente PRIMA del rendering dell'email.
         // Necessario perché $post è null nelle email WooCommerce.
-        // woocommerce_email_before_order_table riceve ($order, $sent_to_admin, $plain_text, $email)
         add_action( 'woocommerce_email_before_order_table', array( $this, 'capture_email_order_id' ), 1, 1 );
 
         // Mostra il blocco tracking GLS nella pagina "Visualizza ordine" dell'account cliente
-        // hook: woocommerce_order_details_after_order_table — riceve $order come argomento
         add_action( 'woocommerce_order_details_after_order_table', array( $this, 'display_tracking_on_order_page' ), 10, 1 );
+
+        // Inietta il tracking GLS nei metadati ordine delle email WooCommerce native.
+        // Questo hook funziona sia con le email WooCommerce standard sia come fallback
+        // quando YayMail processa gli hook nativi. Mostra "Tracking GLS: <link>"
+        // nella sezione metadati dell'email sotto la tabella ordine.
+        add_filter( 'woocommerce_email_order_meta_fields', array( $this, 'add_tracking_to_email_meta' ), 10, 3 );
+    }
+
+    // ========================================================================
+    // HELPER: costruisce l'URL di tracking GLS completo
+    // ========================================================================
+
+    /**
+     * Costruisce l'URL di tracking GLS Italy per un dato numero di spedizione.
+     *
+     * @param string $tracking Numero di tracking GLS
+     * @return string URL completo per il tracking
+     */
+    private function get_tracking_url( $tracking ) {
+        return $this->tracking_base_url . urlencode( $tracking );
+    }
+
+    // ========================================================================
+    // HELPER: lettura/scrittura meta ordine compatibili HPOS
+    //
+    // WooCommerce 8.2+ con HPOS attivo usa tabelle custom per gli ordini.
+    // Le funzioni get_post_meta/update_post_meta scrivono su wp_postmeta,
+    // ma WooCommerce legge da wp_wc_orders_meta → i dati non appaiono.
+    //
+    // I metodi CRUD di WC_Order ($order->get_meta(), ->update_meta_data(),
+    // ->delete_meta_data()) funzionano con ENTRAMBI gli storage backend.
+    // IMPORTANTE: dopo update_meta_data/delete_meta_data serve $order->save().
+    // ========================================================================
+
+    /**
+     * Legge un meta dell'ordine in modo compatibile con HPOS.
+     *
+     * @param int|WC_Order $order_or_id Oggetto ordine o ID ordine
+     * @param string       $key         Chiave del meta
+     * @return string Valore del meta o stringa vuota
+     */
+    private function get_order_meta( $order_or_id, $key ) {
+        $order = ( $order_or_id instanceof WC_Order ) ? $order_or_id : wc_get_order( $order_or_id );
+        if ( ! $order ) {
+            return '';
+        }
+        return $order->get_meta( $key, true );
+    }
+
+    /**
+     * Scrive uno o più meta dell'ordine e salva, in modo compatibile con HPOS.
+     *
+     * @param WC_Order $order Oggetto ordine WooCommerce
+     * @param array    $metas Array associativo chiave => valore dei meta da scrivere
+     */
+    private function update_order_meta( $order, $metas ) {
+        foreach ( $metas as $key => $value ) {
+            $order->update_meta_data( $key, $value );
+        }
+        $order->save();
+    }
+
+    /**
+     * Elimina uno o più meta dell'ordine e salva, in modo compatibile con HPOS.
+     *
+     * @param WC_Order $order Oggetto ordine WooCommerce
+     * @param array    $keys  Array di chiavi meta da eliminare
+     */
+    private function delete_order_meta( $order, $keys ) {
+        foreach ( $keys as $key ) {
+            $order->delete_meta_data( $key );
+        }
+        $order->save();
     }
 
     /**
@@ -442,8 +555,15 @@ class GLS_WooCommerce_Integration_Advanced {
             <hr>
             <h2>Shortcode disponibili</h2>
             <p>
-                <strong>[gls_tracking_number]</strong> — Mostra il codice di tracking GLS nell'email all'ordine del cliente.<br>
-                <small>Usa questo shortcode nei template email WooCommerce (es. "Ordine completato") per includere automaticamente il codice di tracciamento. Se non è ancora disponibile, lo shortcode non mostra nulla.</small>
+                <strong>[gls_tracking_number]</strong> — Mostra il codice di tracking GLS nell'email o nei template.<br>
+                <small>Usa questo shortcode nei template email WooCommerce nativi (es. "Ordine completato") per includere il codice di tracciamento.</small>
+            </p>
+            <h3>Per utenti YayMail Pro</h3>
+            <p>
+                Nel builder YayMail, usa questi shortcode (disponibili nella sezione "Custom Shortcode"):<br>
+                <code>[yaymail_custom_shortcode_gls_tracking]</code> — codice tracking testuale (es. 661209312)<br>
+                <code>[yaymail_custom_shortcode_gls_tracking_link]</code> — bottone HTML cliccabile con link GLS<br>
+                <small>Se il tracking non è ancora disponibile, gli shortcode non mostrano nulla.</small>
             </p>
         </div>
         <?php
@@ -468,8 +588,9 @@ class GLS_WooCommerce_Integration_Advanced {
             return;
         }
 
-        // Se il tracking esiste già e non è forzato, non rigenera
-        if ( ! $force && get_post_meta( $order_id, '_gls_tracking_number', true ) ) {
+        // Se il tracking esiste già e non è forzato, non rigenera.
+        // Usa il metodo CRUD di WC_Order per compatibilità HPOS.
+        if ( ! $force && $order->get_meta( '_gls_tracking_number', true ) ) {
             return;
         }
 
@@ -557,14 +678,14 @@ class GLS_WooCommerce_Integration_Advanced {
 
         // Peso del pacco: somma dei pesi dei prodotti, default 1 Kg
         // Il tag <PesoReale> accetta max 4 interi + 1 decimale (es. "12,5")
-        $peso = 1;
+        $peso = 0;
         foreach ( $order->get_items() as $item ) {
             $product = $item->get_product();
             if ( $product && $product->get_weight() ) {
                 $peso += (float) $product->get_weight() * $item->get_quantity();
             }
         }
-        // Arrotondamento a 1 decimale come da specifica
+        // Minimo 1 Kg, arrotondamento a 1 decimale come da specifica
         $peso = round( max( $peso, 1 ), 1 );
 
         // --- Costruzione XML ---
@@ -671,10 +792,6 @@ class GLS_WooCommerce_Integration_Advanced {
      * La risposta si chiama <InfoLabel> (Ref: MU162 v30, sez. 5.1.4) e contiene
      * SEMPRE un <NumeroSpedizione>, anche per spedizioni GLS CHECK (routing fallito).
      *
-     * Il tag <NoteSpedizione> nella RISPOSTA contiene eventuali avvisi di routing
-     * (es. "Dati non accettabili: ...") ma NON è un errore bloccante se NumeroSpedizione
-     * è presente.
-     *
      * @param string   $xml_response Corpo della risposta HTTP
      * @param WC_Order $order        Oggetto ordine WooCommerce
      */
@@ -704,18 +821,18 @@ class GLS_WooCommerce_Integration_Advanced {
         }
 
         // Fase 5: Estrazione NumeroSpedizione - IL CHECK PIÙ IMPORTANTE
-        // Ref: MU162 v30 sez. 5.1.4 - Il NumeroSpedizione è SEMPRE presente nella
-        // risposta InfoLabel, sia per spedizioni correttamente instradate sia per GLS CHECK.
         if ( isset( $xml->Parcel->NumeroSpedizione ) && ! empty( trim( (string) $xml->Parcel->NumeroSpedizione ) ) ) {
             $track = trim( (string) $xml->Parcel->NumeroSpedizione );
 
             // Salva il tracking number nei metadati dell'ordine.
-            // _gls_tracking_number  → meta privato (prefisso _), usato internamente dal plugin.
-            // gls_tracking_number   → meta pubblico (senza prefisso _), visibile nella metabox
-            //                         "Campi personalizzati" del backend e accessibile da YayMail
-            //                         tramite la variabile {{gls_tracking_number}}.
-            update_post_meta( $order->get_id(), '_gls_tracking_number', $track );
-            update_post_meta( $order->get_id(), 'gls_tracking_number', $track );
+            // Usa il metodo CRUD di WC_Order per compatibilità HPOS.
+            //   _gls_tracking_number  → meta privato (prefisso _), usato internamente dal plugin
+            //   gls_tracking_number   → meta pubblico (senza prefisso _), visibile nella metabox
+            //                           "Campi personalizzati" del backend e accessibile da YayMail
+            $this->update_order_meta( $order, array(
+                '_gls_tracking_number' => $track,
+                'gls_tracking_number'  => $track,
+            ) );
 
             // Determina se è una spedizione GLS CHECK (routing fallito)
             $sede_destino    = isset( $xml->Parcel->DescrizioneSedeDestino ) ? trim( (string) $xml->Parcel->DescrizioneSedeDestino ) : '';
@@ -747,7 +864,11 @@ class GLS_WooCommerce_Integration_Advanced {
                 if ( $pdf_content !== false && strlen( $pdf_content ) > 0 ) {
                     file_put_contents( $pdf_path, $pdf_content );
                     $note .= ' | <a href="' . esc_url( $pdf_url ) . '" target="_blank">Scarica Etichetta PDF</a>';
-                    update_post_meta( $order->get_id(), '_gls_label_pdf_url', $pdf_url );
+
+                    // Salva URL del PDF nei meta ordine (HPOS-compatible)
+                    $this->update_order_meta( $order, array(
+                        '_gls_label_pdf_url' => $pdf_url,
+                    ) );
 
                     // Invia l'etichetta PDF all'email dell'amministratore
                     $this->send_label_to_admin( $order, $track, $pdf_path, $pdf_url );
@@ -758,7 +879,7 @@ class GLS_WooCommerce_Integration_Advanced {
             return;
         }
 
-        // Fase 6: Nessun NumeroSpedizione trovato - questo è anomalo, logga per diagnostica
+        // Fase 6: Nessun NumeroSpedizione trovato - anomalo, logga per diagnostica
         $note_sped = isset( $xml->Parcel->NoteSpedizione ) ? (string) $xml->Parcel->NoteSpedizione : 'N/A';
         $order->add_order_note(
             'GLS Error: Nessun NumeroSpedizione nella risposta. NoteSpedizione: ' . esc_html( $note_sped )
@@ -773,7 +894,6 @@ class GLS_WooCommerce_Integration_Advanced {
 
     /**
      * Invia l'etichetta PDF GLS all'email dell'amministratore del sito.
-     * Il dipendente potrà aprire l'email, scaricare il PDF e stampare l'etichetta.
      *
      * @param WC_Order $order     Oggetto ordine WooCommerce
      * @param string   $tracking  Numero di tracking GLS
@@ -781,17 +901,14 @@ class GLS_WooCommerce_Integration_Advanced {
      * @param string   $pdf_url   URL pubblico del file PDF
      */
     private function send_label_to_admin( $order, $tracking, $pdf_path, $pdf_url ) {
-        // Destinatario: email dell'amministratore WordPress
         $admin_email = get_option( 'admin_email' );
 
-        // Soggetto email
         $subject = sprintf(
             '[GLS] Etichetta spedizione Ordine #%s - Tracking: %s',
             $order->get_order_number(),
             $tracking
         );
 
-        // Corpo email con informazioni essenziali per il dipendente
         $customer_name    = $order->get_shipping_first_name() . ' ' . $order->get_shipping_last_name();
         $shipping_address = $order->get_shipping_address_1() . ', ' . $order->get_shipping_city() . ' (' . $order->get_shipping_state() . ')';
 
@@ -807,18 +924,14 @@ class GLS_WooCommerce_Integration_Advanced {
         $message .= "2. Applica l'etichetta sul pacco\n";
         $message .= "3. Consegna il pacco al corriere GLS\n\n";
         $message .= "Link diretto al PDF: " . $pdf_url . "\n\n";
-        $message .= "Tracking online: https://gls-group.eu/track/" . $tracking . "\n";
+        $message .= "Tracking online: " . $this->get_tracking_url( $tracking ) . "\n";
 
-        // Intestazioni email
-        $headers = array( 'Content-Type: text/plain; charset=UTF-8' );
-
-        // Allegato: il file PDF dell'etichetta (se esiste fisicamente)
+        $headers     = array( 'Content-Type: text/plain; charset=UTF-8' );
         $attachments = array();
         if ( file_exists( $pdf_path ) ) {
             $attachments[] = $pdf_path;
         }
 
-        // Invio email
         $sent = wp_mail( $admin_email, $subject, $message, $headers, $attachments );
 
         if ( ! $sent ) {
@@ -833,11 +946,6 @@ class GLS_WooCommerce_Integration_Advanced {
     /**
      * Hook: cattura l'ID ordine corrente prima del rendering dell'email WooCommerce.
      *
-     * WooCommerce renderizza le email fuori dal loop di WordPress: $post è null
-     * e lo shortcode non può risalire all'ordine. Questo metodo viene chiamato
-     * dall'hook woocommerce_email_before_order_table (che riceve $order come primo
-     * argomento) e salva l'ID in una proprietà statica accessibile dallo shortcode.
-     *
      * @param WC_Order $order Oggetto ordine passato dal sistema email WooCommerce
      */
     public function capture_email_order_id( $order ) {
@@ -847,15 +955,40 @@ class GLS_WooCommerce_Integration_Advanced {
     }
 
     /**
+     * Aggiunge il tracking GLS ai campi meta delle email WooCommerce native.
+     *
+     * Questo hook (woocommerce_email_order_meta_fields) inietta automaticamente
+     * il tracking nella sezione "Order Meta" delle email. Funziona sia con le email
+     * WooCommerce standard sia come fallback quando YayMail processa gli hook nativi.
+     *
+     * @param array    $fields Campi meta già registrati
+     * @param bool     $sent_to_admin Se l'email è diretta all'admin
+     * @param WC_Order $order Oggetto ordine corrente
+     * @return array Campi meta con tracking GLS aggiunto
+     */
+    public function add_tracking_to_email_meta( $fields, $sent_to_admin, $order ) {
+        if ( ! $order instanceof WC_Order ) {
+            return $fields;
+        }
+
+        $tracking = $order->get_meta( '_gls_tracking_number', true );
+        if ( ! empty( $tracking ) ) {
+            $tracking_url = $this->get_tracking_url( $tracking );
+            $fields['gls_tracking'] = array(
+                'label' => __( 'Tracking GLS', 'woocommerce' ),
+                'value' => '<a href="' . esc_url( $tracking_url ) . '" target="_blank" style="color:#e2001a;font-weight:bold;">'
+                         . esc_html( $tracking ) . '</a>',
+            );
+        }
+
+        return $fields;
+    }
+
+    /**
      * Shortcode [gls_tracking_number] per i template email WooCommerce.
      *
-     * COME USARLO nei template email WooCommerce (es. "Ordine completato"):
-     *   Il tuo codice di tracciamento: [gls_tracking_number]
-     *   Traccia la tua spedizione: [gls_tracking_number link="yes"]
-     *   Stato spedizione: [gls_tracking_number fallback="In preparazione"]
-     *
      * Attributi:
-     *   order_id  — ID ordine esplicito (opzionale, di solito non serve)
+     *   order_id  — ID ordine esplicito (opzionale)
      *   link      — "yes" (default) avvolge il codice in un link GLS, "no" restituisce solo testo
      *   fallback  — testo mostrato se il tracking non è ancora disponibile (default: stringa vuota)
      *
@@ -898,14 +1031,15 @@ class GLS_WooCommerce_Integration_Advanced {
             return esc_html( $atts['fallback'] );
         }
 
-        $tracking = get_post_meta( $order_id, '_gls_tracking_number', true );
+        // Usa il metodo CRUD per compatibilità HPOS
+        $tracking = $this->get_order_meta( $order_id, '_gls_tracking_number' );
 
         if ( empty( $tracking ) ) {
             return esc_html( $atts['fallback'] );
         }
 
         if ( $atts['link'] === 'yes' ) {
-            $tracking_url = 'https://gls-group.eu/track/' . urlencode( $tracking );
+            $tracking_url = $this->get_tracking_url( $tracking );
             return '<a href="' . esc_url( $tracking_url ) . '" target="_blank" style="color:#e2001a;font-weight:bold;">'
                 . esc_html( $tracking )
                 . '</a>';
@@ -917,10 +1051,6 @@ class GLS_WooCommerce_Integration_Advanced {
     /**
      * Mostra il blocco di tracking GLS nella pagina "Visualizza ordine" dell'account cliente.
      *
-     * Agganciato all'hook woocommerce_order_details_after_order_table che viene eseguito
-     * nelle pagine: /account/visualizza-ordine/{id}/ e nell'email riepilogo ordine.
-     * Mostra il blocco solo se il numero di spedizione GLS è presente nei metadati.
-     *
      * @param WC_Order $order Oggetto ordine corrente
      */
     public function display_tracking_on_order_page( $order ) {
@@ -928,13 +1058,14 @@ class GLS_WooCommerce_Integration_Advanced {
             return;
         }
 
-        $tracking = get_post_meta( $order->get_id(), '_gls_tracking_number', true );
+        // Usa il metodo CRUD per compatibilità HPOS
+        $tracking = $order->get_meta( '_gls_tracking_number', true );
 
         if ( empty( $tracking ) ) {
             return;
         }
 
-        $tracking_url = 'https://gls-group.eu/track/' . urlencode( $tracking );
+        $tracking_url = $this->get_tracking_url( $tracking );
         ?>
         <section class="woocommerce-gls-tracking" style="margin:2em 0; padding:1em 1.5em; background:#f8f8f8; border-left:4px solid #f2c200;">
             <h2 style="font-size:1em; margin:0 0 0.5em; color:#333;">
@@ -963,26 +1094,10 @@ class GLS_WooCommerce_Integration_Advanced {
     // ========================================================================
     // CANCELLAZIONE SPEDIZIONE (DeleteSped)
     // Ref: MU162 Label Service v30, sezione 5.4
-    //
-    // AVVERTENZA IMPORTANTE dalla documentazione GLS:
-    // "Cancellare una spedizione con il metodo 'DeleteSped' se già 'Chiusa'
-    // (inviata alla sede tramite CloseWorkDay) non inibisce l'inoltro della
-    // spedizione e delle relative informazioni nel circuito GLS."
-    // In tal caso è necessario contattare direttamente la sede GLS per
-    // bloccare fisicamente la spedizione.
     // ========================================================================
 
     /**
      * Cancella la spedizione GLS quando un ordine WooCommerce viene annullato.
-     * Viene chiamato automaticamente al cambio stato → "cancelled".
-     *
-     * Struttura XML richiesta (MU162 §5.4):
-     *   <DeleteSped>
-     *     <SedeGls>YH</SedeGls>
-     *     <CodiceClienteGls>74453</CodiceClienteGls>
-     *     <PasswordClienteGls>password</PasswordClienteGls>
-     *     <NumSpedizione>620000761</NumSpedizione>
-     *   </DeleteSped>
      *
      * @param int $order_id ID dell'ordine WooCommerce annullato
      */
@@ -992,10 +1107,9 @@ class GLS_WooCommerce_Integration_Advanced {
             return;
         }
 
-        // Verifica se esiste un tracking number per questo ordine
-        $tracking = get_post_meta( $order_id, '_gls_tracking_number', true );
+        // Verifica se esiste un tracking number per questo ordine (HPOS-compatible)
+        $tracking = $order->get_meta( '_gls_tracking_number', true );
         if ( empty( $tracking ) ) {
-            // Nessuna spedizione GLS da cancellare
             return;
         }
 
@@ -1010,8 +1124,6 @@ class GLS_WooCommerce_Integration_Advanced {
         }
 
         // Costruisce l'XML per DeleteSped (Ref: MU162 §5.4)
-        // La struttura root è <DeleteSped>, NON <Info> come per AddParcel/CloseWorkDay.
-        // NumSpedizione: il numero di tracking GLS restituito da AddParcel.
         $xml  = '<DeleteSped>';
         $xml .= '<SedeGls>' . esc_html( $sede ) . '</SedeGls>';
         $xml .= '<CodiceClienteGls>' . esc_html( $cliente ) . '</CodiceClienteGls>';
@@ -1019,14 +1131,11 @@ class GLS_WooCommerce_Integration_Advanced {
         $xml .= '<NumSpedizione>' . esc_html( $tracking ) . '</NumSpedizione>';
         $xml .= '</DeleteSped>';
 
-        // Log di debug in error_log (password mascherata) per facilitare diagnosi
+        // Log di debug in error_log (password mascherata)
         $xml_log = str_replace( esc_html( $password ), '***', $xml );
         error_log( 'GLS DeleteSped XML sent order #' . $order_id . ': ' . $xml_log );
 
-        // NOTA: la documentazione MU162 §5.4 non specifica esplicitamente il nome del
-        // parametro HTTP POST per DeleteSped (a differenza di AddParcel → "XMLInfoParcel"
-        // e CloseWorkDay → "XMLInfo"). Proviamo prima con "XMLInfo" (pattern più comune),
-        // poi con "XMLInfoSped" come fallback in caso di HTTP 500/errore.
+        // Prova prima con "XMLInfo", poi con "XMLInfoSped" come fallback
         $param_names = array( 'XMLInfo', 'XMLInfoSped' );
         $response    = null;
         $http_code   = 0;
@@ -1053,16 +1162,12 @@ class GLS_WooCommerce_Integration_Advanced {
 
             error_log( 'GLS DeleteSped param="' . $param_name . '" HTTP ' . $http_code . ' order #' . $order_id . ': ' . substr( $body, 0, 300 ) );
 
-            // Se la risposta non è un 500 server error, usiamo questa risposta
             if ( $http_code !== 500 ) {
                 break;
             }
         }
 
-        // Gestione HTTP 500: può dipendere da:
-        // 1) Nome parametro POST errato (il server non trova il metodo)
-        // 2) Ambiente di test GLS che non espone DeleteSped
-        // 3) Errore lato server GLS (transitorio)
+        // Gestione HTTP 500
         if ( $http_code === 500 ) {
             $order->add_order_note(
                 '⚠️ GLS: Il server ha restituito HTTP 500 durante la cancellazione della spedizione ' . $tracking . '. '
@@ -1071,9 +1176,8 @@ class GLS_WooCommerce_Integration_Advanced {
                 . 'Contatta la sede GLS per procedere manualmente. '
                 . 'Il tracking è stato rimosso dall\'ordine.'
             );
-            // Rimuove comunque il tracking per evitare doppi tentativi
-            delete_post_meta( $order->get_id(), '_gls_tracking_number' );
-            delete_post_meta( $order->get_id(), '_gls_label_pdf_url' );
+            // Rimuove comunque il tracking (HPOS-compatible)
+            $this->delete_order_meta( $order, array( '_gls_tracking_number', 'gls_tracking_number', '_gls_label_pdf_url' ) );
             error_log( 'GLS DeleteSped HTTP 500 body order #' . $order_id . ': ' . substr( $body, 0, 500 ) );
             return;
         }
@@ -1086,73 +1190,42 @@ class GLS_WooCommerce_Integration_Advanced {
         }
 
         // Parsing della risposta
-        // La risposta GLS per DeleteSped contiene messaggi di esito in testo semplice
-        // o un tag XML con <DescrizioneErrore>. Esempi dalla doc MU162 §5.4:
-        //   - "Eliminazione della spedizione xxxxxxxxx avvenuta." → successo
-        //   - "Spedizione xxxxxxxxx non presente."                → già cancellata
-        //   - "Funzionalità non abilitata. ..."                   → errore account
         $this->parse_delete_sped_response( $body, $order, $tracking );
     }
 
     /**
      * Analizza la risposta della chiamata DeleteSped.
      *
-     * La documentazione (MU162 §5.4) elenca i possibili messaggi di errore/esito:
-     *   - "Eliminazione della spedizione xxxxxxxxx avvenuta."
-     *   - "Spedizione xxxxxxxxx non presente."
-     *   - "Sigla sede non specificata."
-     *   - "Codice cliente Gls non valido."
-     *   - "Numero di spedizione Gls non valido."
-     *   - "Impossibile connettersi al web server centrale."
-     *   - "Funzionalità non abilitata. Contattare la sede di competenza."
-     *
-     * AVVERTENZA: se la spedizione era già "Chiusa" (CloseWorkDay eseguito),
-     * la cancellazione sul webservice non impedisce l'inoltro fisico nel circuito GLS.
-     * In quel caso è necessario contattare direttamente la sede GLS.
-     *
      * @param string   $response_body Corpo della risposta HTTP grezza
      * @param WC_Order $order         Oggetto ordine WooCommerce
      * @param string   $tracking      Numero di tracking GLS
      */
     private function parse_delete_sped_response( $response_body, $order, $tracking ) {
-        // Estrai la risposta dal wrapper ASMX se presente
         $inner = $this->extract_asmx_response( $response_body );
 
-        // Prova a leggere come XML per trovare eventuali tag <DescrizioneErrore>
         $xml = @simplexml_load_string( $inner );
 
         if ( $xml !== false && isset( $xml->DescrizioneErrore ) ) {
             $desc = trim( (string) $xml->DescrizioneErrore );
         } else {
-            // Risposta in testo semplice (tipico di DeleteSped)
             $desc = trim( strip_tags( $inner ) );
         }
 
-        // Normalizza per confronto case-insensitive
         $desc_lower = strtolower( $desc );
 
         if ( strpos( $desc_lower, 'avvenuta' ) !== false || strpos( $desc_lower, 'eliminazione' ) !== false ) {
-            // Cancellazione avvenuta con successo
             $order->add_order_note( '✅ Spedizione GLS ' . $tracking . ' cancellata con successo sul webservice GLS.' );
-            // Rimuove il tracking number dai metadati (sia privato che pubblico)
-            delete_post_meta( $order->get_id(), '_gls_tracking_number' );
-            delete_post_meta( $order->get_id(), 'gls_tracking_number' );
-            delete_post_meta( $order->get_id(), '_gls_label_pdf_url' );
+            // Rimuove tracking e PDF (HPOS-compatible)
+            $this->delete_order_meta( $order, array( '_gls_tracking_number', 'gls_tracking_number', '_gls_label_pdf_url' ) );
 
         } elseif ( strpos( $desc_lower, 'non presente' ) !== false ) {
-            // Spedizione già non presente sul webservice (es. mai inviata o già cancellata)
             $order->add_order_note( 'ℹ️ Spedizione GLS ' . $tracking . ' non trovata sul webservice (potrebbe essere già stata cancellata).' );
-            delete_post_meta( $order->get_id(), '_gls_tracking_number' );
-            delete_post_meta( $order->get_id(), 'gls_tracking_number' );
+            $this->delete_order_meta( $order, array( '_gls_tracking_number', 'gls_tracking_number' ) );
 
         } elseif ( strpos( $desc_lower, 'funzionalità non abilitata' ) !== false ) {
-            // La funzione DeleteSped non è abilitata per questo account GLS
             $order->add_order_note( '⛔ GLS: Funzionalità DeleteSped non abilitata per questo account. Contatta la sede GLS per annullare manualmente la spedizione ' . $tracking . '.' );
 
         } else {
-            // Risposta generica o errore non riconosciuto.
-            // AVVERTENZA: se la spedizione è già "Chiusa", la cancellazione sul webservice
-            // non blocca l'inoltro fisico nel circuito GLS (Ref: MU162 §5.4).
             $note  = '⚠️ GLS: Risposta cancellazione spedizione ' . $tracking . ': ' . esc_html( $desc );
             $note .= ' | ATTENZIONE: se la spedizione è già stata inviata alla sede GLS tramite CloseWorkDay, contatta direttamente la sede GLS per bloccarla fisicamente.';
             $order->add_order_note( $note );
@@ -1162,24 +1235,13 @@ class GLS_WooCommerce_Integration_Advanced {
     /**
      * Estrae il contenuto XML reale dalla risposta ASMX.
      *
-     * L'endpoint .asmx può restituire la risposta in due formati:
-     *
-     * 1) Wrappata in <string> (tipico di HTTP POST via form-urlencoded):
-     *    <string xmlns="http://tempuri.org/">&lt;InfoLabel&gt;...&lt;/InfoLabel&gt;</string>
-     *
-     * 2) Diretta (già XML puro):
-     *    <InfoLabel xmlns="">...</InfoLabel>
-     *
-     * Ref: MU162 v30 sez. 5.1.4 - La risposta AddParcel ha root element <InfoLabel>.
-     *
      * @param string $raw_response Risposta HTTP grezza
      * @return string XML pulito pronto per il parsing
      */
     private function extract_asmx_response( $raw_response ) {
-        // Rimuove eventuali BOM (Byte Order Mark) UTF-8
+        // Rimuove eventuali BOM UTF-8
         $raw_response = ltrim( $raw_response, "\xEF\xBB\xBF" );
 
-        // Prova a caricare come XML per verificare se è wrappato in <string>
         $wrapper = @simplexml_load_string( $raw_response );
 
         if ( $wrapper !== false ) {
@@ -1193,28 +1255,22 @@ class GLS_WooCommerce_Integration_Advanced {
                 }
             }
 
-            // Caso 2: Root è già InfoLabel, Info o simile → risposta diretta
+            // Caso 2: Root è già InfoLabel, Info o simile
             if ( in_array( $root_name, array( 'InfoLabel', 'Info' ), true ) || isset( $wrapper->Parcel ) ) {
                 return $raw_response;
             }
         }
 
-        // Fallback: restituisce la risposta così com'è
         return $raw_response;
     }
 
     // ========================================================================
     // CLOSEWORKDAY - Chiusura giornaliera
     // Ref: MU162 Label Service v30, sezione 5.2
-    //
-    // La CloseWorkDay conferma alla sede GLS le spedizioni create durante la giornata.
-    // Senza questa operazione le spedizioni restano in stato "Aperto" e non vengono
-    // elaborate per il ritiro.
     // ========================================================================
 
     /**
-     * Schedula il cron WordPress per eseguire la CloseWorkDay ogni giorno.
-     * L'evento è pianificato per le 18:00 (orario server).
+     * Schedula il cron WordPress per eseguire la CloseWorkDay ogni giorno alle 18:00.
      */
     public function schedule_cron() {
         if ( ! wp_next_scheduled( 'gls_daily_close_work_day' ) ) {
@@ -1238,16 +1294,6 @@ class GLS_WooCommerce_Integration_Advanced {
 
     /**
      * Esegue la chiamata CloseWorkDay all'API GLS.
-     *
-     * Struttura XML richiesta:
-     *   <Info>
-     *     <SedeGls>...</SedeGls>
-     *     <CodiceClienteGls>...</CodiceClienteGls>
-     *     <PasswordClienteGls>...</PasswordClienteGls>
-     *     <CloseWorkDayResult>S</CloseWorkDayResult>
-     *   </Info>
-     *
-     * Il parametro HTTP si chiama "XMLInfo" (diverso da AddParcel che usa "XMLInfoParcel").
      */
     public function execute_close_work_day() {
         $sede     = trim( get_option( 'gls_sede' ) );
@@ -1259,12 +1305,10 @@ class GLS_WooCommerce_Integration_Advanced {
             return;
         }
 
-        // Costruzione XML per CloseWorkDay
         $xml  = '<Info>';
         $xml .= '<SedeGls>' . esc_html( $sede ) . '</SedeGls>';
         $xml .= '<CodiceClienteGls>' . esc_html( $cliente ) . '</CodiceClienteGls>';
         $xml .= '<PasswordClienteGls>' . esc_html( $password ) . '</PasswordClienteGls>';
-        // CloseWorkDayResult = "S" per ricevere lo stato delle spedizioni trasmesse
         $xml .= '<CloseWorkDayResult>S</CloseWorkDayResult>';
         $xml .= '</Info>';
 
@@ -1289,7 +1333,6 @@ class GLS_WooCommerce_Integration_Advanced {
 // ============================================================================
 add_action( 'admin_post_gls_manual_close_work_day', 'gls_manual_cwd_handler' );
 function gls_manual_cwd_handler() {
-    // Verifica nonce di sicurezza e permessi utente
     if (
         ! isset( $_POST['gls_cwd_nonce'] )
         || ! wp_verify_nonce( $_POST['gls_cwd_nonce'], 'gls_manual_cwd' )
@@ -1306,6 +1349,81 @@ function gls_manual_cwd_handler() {
 
 // Inizializza il core del plugin
 new GLS_WooCommerce_Integration_Advanced();
+
+
+// ============================================================================
+// INTEGRAZIONE YAYMAIL PRO — Shortcode custom per il tracking GLS
+//
+// YayMail Pro NON processa shortcode WordPress standard né i filtri
+// yaymail_custom_variables / yaymail_custom_variable_value (che non esistono).
+//
+// Il filtro corretto è: yaymail_customs_shortcode (con la "s")
+// Gli shortcode DEVONO avere il prefisso: [yaymail_custom_shortcode_*]
+//
+// Ref: https://docs.yaycommerce.com/yaymail/drag-and-drop-email-builder/
+//      upper-area-of-the-editor-screen/custom-shortcode
+//
+// Shortcode registrati:
+//   [yaymail_custom_shortcode_gls_tracking]      — codice tracking testuale
+//   [yaymail_custom_shortcode_gls_tracking_link]  — bottone HTML cliccabile GLS
+//
+// Come usarli in YayMail:
+//   1. Apri YayMail → Email Customizer
+//   2. Seleziona il template (es. "Ordine in lavorazione" o "Ordine completato")
+//   3. Nel pannello shortcode, trova "Custom Shortcode" in fondo alla lista
+//   4. Clicca [yaymail_custom_shortcode_gls_tracking] o _gls_tracking_link
+//      per inserirlo nel template
+//
+// NOTA: gli shortcode custom di YayMail funzionano solo con ordini reali,
+// NON nelle email di test inviate dal builder. Questo è un limite di YayMail.
+// ============================================================================
+
+add_filter( 'yaymail_customs_shortcode', 'gls_register_yaymail_shortcodes', 10, 3 );
+
+/**
+ * Registra gli shortcode GLS nel pannello shortcode di YayMail Pro.
+ *
+ * Il filtro yaymail_customs_shortcode riceve:
+ *   $shortcode_list       — array associativo [shortcode] => valore
+ *   $yaymail_informations — informazioni interne di YayMail (non usate qui)
+ *   $args                 — array con chiave 'order' (WC_Order) se disponibile
+ *
+ * @param array $shortcode_list Lista shortcode registrati
+ * @param mixed $yaymail_informations Informazioni YayMail
+ * @param array $args Argomenti con 'order' se presente un ordine reale
+ * @return array Lista shortcode aggiornata
+ */
+function gls_register_yaymail_shortcodes( $shortcode_list, $yaymail_informations, $args = array() ) {
+
+    // URL base per il tracking GLS Italy
+    $tracking_base_url = 'https://www.gls-italy.com/it/servizi/servizi-per-chi-riceve/ricerca-spedizioni?match=';
+
+    // --- Shortcode 1: codice tracking testuale ---
+    $tracking_value = '';
+    if ( isset( $args['order'] ) && $args['order'] instanceof WC_Order ) {
+        $tracking_value = $args['order']->get_meta( '_gls_tracking_number', true );
+    }
+    // Se non c'è un ordine reale (es. anteprima nel builder), mostra un placeholder
+    $shortcode_list['[yaymail_custom_shortcode_gls_tracking]'] = ! empty( $tracking_value )
+        ? esc_html( $tracking_value )
+        : '';
+
+    // --- Shortcode 2: bottone HTML cliccabile con link tracking ---
+    if ( ! empty( $tracking_value ) ) {
+        $tracking_url = $tracking_base_url . urlencode( $tracking_value );
+        $shortcode_list['[yaymail_custom_shortcode_gls_tracking_link]'] =
+            '<a href="' . esc_url( $tracking_url ) . '" '
+            . 'target="_blank" rel="noopener noreferrer" '
+            . 'style="display:inline-block;padding:8px 18px;background:#e2001a;color:#ffffff;'
+            . 'text-decoration:none;border-radius:4px;font-weight:bold;font-size:14px;">'
+            . 'Traccia la tua spedizione GLS &rarr;'
+            . '</a>';
+    } else {
+        $shortcode_list['[yaymail_custom_shortcode_gls_tracking_link]'] = '';
+    }
+
+    return $shortcode_list;
+}
 
 
 // ============================================================================
@@ -1335,19 +1453,12 @@ function gls_custom_shipping_method_init() {
                 $this->title   = 'Corriere Espresso GLS';
             }
 
-            /**
-             * Inizializza campi del form e impostazioni.
-             */
             public function init() {
                 $this->init_form_fields();
                 $this->init_settings();
                 add_action( 'woocommerce_update_options_shipping_' . $this->id, array( $this, 'process_admin_options' ) );
             }
 
-            /**
-             * Definisce i campi configurabili per le tariffe.
-             * Le tariffe sono suddivise per zona: Italia base, Calabria/Sicilia, Sardegna.
-             */
             public function init_form_fields() {
                 $this->form_fields = array(
                     'enabled' => array(
@@ -1404,13 +1515,6 @@ function gls_custom_shipping_method_init() {
              * Calcola il costo di spedizione in base al peso del carrello
              * e alla zona di destinazione.
              *
-             * Logica:
-             * 1. Determina la zona (IT base, Calabria/Sicilia, Sardegna)
-             * 2. Applica la tariffa corrispondente allo scaglione di peso
-             * 3. Aggiunge maggiorazione per isole minori/laguna se applicabile
-             * 4. Applica IVA
-             * 5. Azzera il costo se raggiunta la soglia di spedizione gratuita
-             *
              * @param array $package Pacchetto di spedizione WooCommerce
              */
             public function calculate_shipping( $package = array() ) {
@@ -1427,10 +1531,8 @@ function gls_custom_shipping_method_init() {
                     'CZ', 'CS', 'KR', 'RC', 'VV',
                     'AG', 'CL', 'CT', 'EN', 'ME', 'PA', 'RG', 'SR', 'TP',
                 );
-                // Province della Sardegna
                 $sardegna = array( 'CA', 'NU', 'OR', 'SS', 'SU' );
 
-                // Determina il prefisso tariffario in base alla zona
                 if ( in_array( $state, $calabria_sicilia ) ) {
                     $prefix = 'cs_';
                 } elseif ( in_array( $state, $sardegna ) ) {
@@ -1454,19 +1556,17 @@ function gls_custom_shipping_method_init() {
                 } elseif ( $weight <= 100 ) {
                     $cost = (float) $this->get_option( $prefix . '50_100' );
                 } elseif ( $weight <= 500 ) {
-                    // Da 100 a 500 Kg: tariffa base 50-100 + extra per ogni 50 Kg aggiuntivi
                     $base  = (float) $this->get_option( $prefix . '50_100' );
                     $extra = (float) $this->get_option( $prefix . 'extra_50' );
                     $cost  = $base + ( ceil( ( $weight - 100 ) / 50 ) * $extra );
                 } else {
-                    // Oltre 500 Kg: base + 8 scaglioni da 50 Kg (per 100→500) + extra per ogni 100 Kg sopra i 500
                     $base      = (float) $this->get_option( $prefix . '50_100' );
                     $extra_50  = (float) $this->get_option( $prefix . 'extra_50' );
                     $extra_100 = (float) $this->get_option( $prefix . 'extra_100' );
                     $cost      = $base + ( 8 * $extra_50 ) + ( ceil( ( $weight - 500 ) / 100 ) * $extra_100 );
                 }
 
-                // Maggiorazione per isole minori e zone lagunari (Venezia, Capri, Ischia, ecc.)
+                // Maggiorazione per isole minori e zone lagunari
                 $isole_minori_cap = array(
                     '30121', '30122', '30123', '30124', '30125', '30126', '30132', '30133', '30141',
                     '80073', '80071',
@@ -1481,7 +1581,7 @@ function gls_custom_shipping_method_init() {
                 $vat_rate      = (float) get_option( 'gls_vat_rate', '22' );
                 $cost_with_vat = $cost * ( 1 + ( $vat_rate / 100 ) );
 
-                // Spedizione gratuita se il totale carrello supera la soglia configurata
+                // Spedizione gratuita sopra soglia
                 $free_threshold           = (float) get_option( 'gls_free_shipping_threshold', '0' );
                 $cart_total_for_threshold = WC()->cart->get_cart_contents_total() + WC()->cart->get_cart_contents_tax();
 
@@ -1509,14 +1609,11 @@ function add_gls_custom_shipping_method( $methods ) {
 
 // ============================================================================
 // CALCOLO SOVRATASSA CONTRASSEGNO NEL CARRELLO
-// Aggiunge un supplemento quando il cliente sceglie il pagamento in contrassegno.
 // ============================================================================
 add_action( 'woocommerce_cart_calculate_fees', 'gls_add_cod_fee', 20, 1 );
 
 /**
  * Calcola e aggiunge il supplemento contrassegno al carrello.
- * Il supplemento è calcolato come percentuale del totale (carrello + spedizione),
- * con un importo minimo configurabile. L'IVA viene applicata sul netto.
  *
  * @param WC_Cart $cart Oggetto carrello WooCommerce
  */
@@ -1525,10 +1622,8 @@ function gls_add_cod_fee( $cart ) {
         return;
     }
 
-    // Determina il metodo di pagamento scelto dal cliente
     $chosen_payment_method = WC()->session->get( 'chosen_payment_method' );
 
-    // Override dal POST (durante il cambio metodo di pagamento al checkout)
     if ( isset( $_POST['payment_method'] ) ) {
         $chosen_payment_method = wc_clean( wp_unslash( $_POST['payment_method'] ) );
     } elseif ( isset( $_POST['post_data'] ) ) {
@@ -1543,13 +1638,10 @@ function gls_add_cod_fee( $cart ) {
         $min_fee    = (float) get_option( 'gls_cod_min_fee', '5.00' );
         $vat_rate   = (float) get_option( 'gls_vat_rate', '22' );
 
-        // Base di calcolo: contenuto carrello + spedizione (netto)
         $cart_total = $cart->get_cart_contents_total() + $cart->get_shipping_total();
-        // Applica la percentuale con importo minimo, poi aggiunge IVA
         $base_fee     = max( $min_fee, $cart_total * ( $percentage / 100 ) );
         $fee_with_vat = $base_fee * ( 1 + ( $vat_rate / 100 ) );
 
-        // Aggiunge come fee non tassabile (IVA già inclusa nel calcolo)
         $cart->add_fee( 'Supplemento Contrassegno GLS', $fee_with_vat, false );
     }
 }
@@ -1557,14 +1649,11 @@ function gls_add_cod_fee( $cart ) {
 
 // ============================================================================
 // AGGIORNAMENTO CHECKOUT AL CAMBIO METODO DI PAGAMENTO
-// Forza il ricalcolo dei totali quando il cliente cambia metodo di pagamento.
 // ============================================================================
 add_action( 'wp_footer', 'gls_force_checkout_update' );
 
 /**
- * Inietta lo script jQuery nel footer della pagina checkout.
- * Al cambio del metodo di pagamento, triggera l'evento WooCommerce
- * "update_checkout" che ricalcola totali e fee.
+ * Inietta lo script jQuery per ricalcolare i totali al cambio metodo di pagamento.
  */
 function gls_force_checkout_update() {
     if ( is_checkout() && ! is_wc_endpoint_url() ) {
@@ -1578,96 +1667,4 @@ function gls_force_checkout_update() {
         </script>
         <?php
     }
-}
-
-
-// ============================================================================
-// INTEGRAZIONE YAYMAIL — Variabili custom per il tracking GLS
-//
-// YayMail (Email Customizer for WooCommerce) non processa shortcode WordPress
-// standard. Espone invece il filtro yaymail_custom_variables che permette di
-// registrare variabili drag-and-drop nel suo builder visuale.
-//
-// Variabili registrate:
-//   {{gls_tracking_number}} — codice tracking testuale (es. "661209312")
-//   {{gls_tracking_link}}   — link HTML cliccabile con bottone rosso GLS
-//
-// Come usarle in YayMail:
-//   1. Apri YayMail → Email Customizer
-//   2. Seleziona il template (es. "Ordine completato" o "Ordine in lavorazione")
-//   3. Aggiungi un blocco "Testo" o "HTML" nel template
-//   4. Nel pannello variabili (icona {} o "Custom Variables") troverai
-//      "GLS Tracking Number" e "GLS Tracking Link" in fondo alla lista
-//   5. Clicca sulla variabile per inserirla, oppure scrivi {{gls_tracking_number}}
-//      o {{gls_tracking_link}} direttamente nel testo
-//
-// Le variabili restituiscono stringa vuota se il tracking non è ancora disponibile,
-// quindi sono sicure da inserire anche nelle email inviate prima della spedizione.
-// ============================================================================
-
-/**
- * Registra le variabili custom GLS nel pannello variabili di YayMail.
- *
- * Il filtro yaymail_custom_variables riceve e restituisce un array associativo:
- *   [ 'chiave_variabile' => [ 'label' => '...', 'description' => '...' ] ]
- * La "chiave" diventa il nome tra {{ }} nel template.
- *
- * @param array $variables Variabili già registrate da YayMail e altri plugin
- * @return array Variabili con quelle GLS aggiunte
- */
-add_filter( 'yaymail_custom_variables', 'gls_register_yaymail_variables' );
-function gls_register_yaymail_variables( $variables ) {
-    $variables['gls_tracking_number'] = array(
-        'label'       => 'GLS Tracking Number',
-        'description' => 'Codice di tracking GLS (solo testo, es. 661209312).',
-    );
-    $variables['gls_tracking_link'] = array(
-        'label'       => 'GLS Tracking Link',
-        'description' => 'Bottone cliccabile con codice tracking e link al sito GLS.',
-    );
-    return $variables;
-}
-
-/**
- * Risolve il valore delle variabili custom GLS quando YayMail renderizza l'email.
- *
- * YayMail chiama questo filtro per ogni variabile {{...}} trovata nel template,
- * passando l'oggetto $order relativo all'email in fase di invio.
- *
- * @param string   $value   Valore corrente (da sovrascrivere)
- * @param string   $var_key Chiave della variabile (es. "gls_tracking_number")
- * @param WC_Order $order   Ordine associato all'email corrente
- * @return string Testo o HTML sostitutivo, stringa vuota se tracking non disponibile
- */
-add_filter( 'yaymail_custom_variable_value', 'gls_resolve_yaymail_variable', 10, 3 );
-function gls_resolve_yaymail_variable( $value, $var_key, $order ) {
-    if ( ! in_array( $var_key, array( 'gls_tracking_number', 'gls_tracking_link' ), true ) ) {
-        return $value; // Non è una variabile GLS: lascia invariato
-    }
-
-    if ( ! $order instanceof WC_Order ) {
-        return '';
-    }
-
-    // Legge dal meta privato (fonte canonica del plugin)
-    $tracking = get_post_meta( $order->get_id(), '_gls_tracking_number', true );
-
-    if ( empty( $tracking ) ) {
-        return ''; // Tracking non ancora disponibile: variabile sparisce dal testo
-    }
-
-    $tracking_url = 'https://gls-group.eu/track/' . urlencode( $tracking );
-
-    if ( $var_key === 'gls_tracking_number' ) {
-        // Solo codice testuale: il cliente può copiarlo manualmente
-        return esc_html( $tracking );
-    }
-
-    // gls_tracking_link: bottone stilizzato con il rosso GLS (#e2001a)
-    return '<a href="' . esc_url( $tracking_url ) . '" '
-        . 'target="_blank" rel="noopener noreferrer" '
-        . 'style="display:inline-block;padding:8px 18px;background:#e2001a;color:#ffffff;'
-        . 'text-decoration:none;border-radius:4px;font-weight:bold;font-size:14px;">'
-        . 'Traccia la tua spedizione GLS &rarr;'
-        . '</a>';
 }
