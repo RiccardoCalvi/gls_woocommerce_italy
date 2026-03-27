@@ -3,8 +3,18 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.1.0
+ * Version: 1.1.1
  * Author: Dream2Dev
+ *
+ * Changelog v1.1.1:
+ *   - Fix critico parsing risposta: NumeroSpedizione viene ora controllato PRIMA di NoteSpedizione
+ *     L'API GLS restituisce SEMPRE un tracking (anche per GLS CHECK), ma il codice precedente
+ *     faceva return al controllo NoteSpedizione senza mai leggere il tracking.
+ *     Ref: MU162 v30, sez. 5.1.4 - "il numero ricevuto è già un numero di tracking ufficiale GLS"
+ *   - Fix: gestione root element <InfoLabel xmlns=""> nella risposta (non <Info>)
+ *   - Aggiunta gestione etichette GLS CHECK (routing fallito ma spedizione creata)
+ *   - Aumentato log debug risposta da 300 a 2000 caratteri
+ *   - Aggiunto log specifico di NumeroSpedizione, NoteSpedizione e DescrizioneSedeDestino
  *
  * Changelog v1.1.0:
  *   - Fix critico: corretti nomi tag XML per conformità con documentazione API GLS (MU162 Label Service v30)
@@ -396,9 +406,9 @@ class GLS_WooCommerce_Integration_Advanced {
 
         $order->add_order_note( 'GLS: Inizio comunicazione con API AddParcel...' );
 
-        // Log dell'XML inviato per debug (troncato per sicurezza password)
+        // Log dell'XML inviato per debug (password mascherata)
         $xml_log = preg_replace( '/<PasswordClienteGls>.*?<\/PasswordClienteGls>/', '<PasswordClienteGls>***</PasswordClienteGls>', $xml_data );
-        $order->add_order_note( 'GLS Debug XML inviato: ' . esc_html( substr( $xml_log, 0, 500 ) ) );
+        $order->add_order_note( 'GLS Debug XML inviato: ' . esc_html( $xml_log ) );
 
         // Invio richiesta HTTP POST all'endpoint AddParcel
         // Il parametro si chiama "XMLInfoParcel" come da documentazione MU162
@@ -421,8 +431,8 @@ class GLS_WooCommerce_Integration_Advanced {
             return;
         }
 
-        // Log risposta grezza per debug (troncata)
-        $order->add_order_note( 'GLS Debug risposta (primi 300 char): ' . esc_html( substr( $body, 0, 300 ) ) );
+        // Log risposta grezza per debug (esteso per diagnostica)
+        $order->add_order_note( 'GLS Debug risposta (primi 2000 char): ' . esc_html( substr( $body, 0, 2000 ) ) );
 
         // Parsing della risposta XML
         $this->parse_gls_response( $body, $order );
@@ -586,112 +596,147 @@ class GLS_WooCommerce_Integration_Advanced {
     /**
      * Analizza la risposta XML del metodo AddParcel.
      *
-     * La risposta dell'endpoint ASMX può essere wrappata in un tag <string>:
-     *   <?xml version="1.0" encoding="utf-8"?>
-     *   <string xmlns="http://tempuri.org/">...contenuto XML reale...</string>
+     * La risposta si chiama <InfoLabel> (Ref: MU162 v30, sez. 5.1.4) e contiene
+     * SEMPRE un <NumeroSpedizione>, anche per spedizioni GLS CHECK (routing fallito).
      *
-     * Il contenuto reale è la struttura XML con i tag <Parcel> contenenti
-     * l'esito dell'operazione.
+     * Dalla documentazione: "il numero ricevuto è già un numero di tracking ufficiale GLS.
+     * Le spedizioni verranno comunque inoltrate nel circuito in modo corretto."
+     *
+     * Il tag <NoteSpedizione> nella RISPOSTA contiene eventuali note/errori di routing
+     * (es. "Dati non accettabili: ...") ma NON è un errore bloccante se NumeroSpedizione
+     * è presente.
+     *
+     * IMPORTANTE: Non confondere <NoteSpedizione> della risposta (tag di output in InfoLabel)
+     * con <NoteSpedizione> della richiesta (tag di input nel Parcel).
+     *
+     * L'endpoint .asmx può wrappare la risposta in <string xmlns="http://tempuri.org/">.
      *
      * @param string   $xml_response Corpo della risposta HTTP
      * @param WC_Order $order        Oggetto ordine WooCommerce
      */
     private function parse_gls_response( $xml_response, $order ) {
         // Fase 1: Gestione wrapper ASMX
-        // L'endpoint .asmx/AddParcel restituisce l'XML dentro un tag <string>
-        // con namespace "http://tempuri.org/". Dobbiamo estrarre il contenuto interno.
         $inner_xml = $this->extract_asmx_response( $xml_response );
 
         // Fase 2: Parsing dell'XML effettivo
+        // La risposta ha root <InfoLabel xmlns=""> con uno o più <Parcel> figli
         $xml = @simplexml_load_string( $inner_xml );
         if ( $xml === false ) {
-            $order->add_order_note( 'GLS Error: Risposta XML dal server incomprensibile. Risposta raw: ' . esc_html( substr( $xml_response, 0, 200 ) ) );
+            $order->add_order_note( 'GLS Error: Risposta XML dal server incomprensibile. Risposta raw: ' . esc_html( substr( $xml_response, 0, 500 ) ) );
             return;
         }
 
-        // Fase 3: Controllo errori bloccanti (errore generale, blocca tutta l'operazione)
-        // Ref: MU162 - "DescrizioneErrore" = errore bloccante
+        // Fase 3: Controllo errore bloccante a livello globale
+        // Ref: MU162 - <DescrizioneErrore> fuori da <Parcel> = errore che blocca TUTTA l'operazione
+        // (es. credenziali errate, sede inesistente)
         if ( isset( $xml->DescrizioneErrore ) && ! empty( (string) $xml->DescrizioneErrore ) ) {
             $order->add_order_note( 'Errore GLS (bloccante): ' . (string) $xml->DescrizioneErrore );
             return;
         }
 
-        // Fase 4: Controllo errori a livello di singolo Parcel
-        if ( isset( $xml->Parcel ) ) {
-            // Errore esplicito nel tag DescrizioneErrore del Parcel
-            if ( isset( $xml->Parcel->DescrizioneErrore ) && ! empty( (string) $xml->Parcel->DescrizioneErrore ) ) {
-                $order->add_order_note( 'Errore GLS (API): ' . (string) $xml->Parcel->DescrizioneErrore );
-                return;
-            }
-
-            // Errore "Dati non accettabili" nel tag NoteSpedizione
-            if ( isset( $xml->Parcel->NoteSpedizione ) && strpos( (string) $xml->Parcel->NoteSpedizione, 'Dati non accettabili' ) !== false ) {
-                $order->add_order_note( 'Errore GLS (Dati non validi): ' . (string) $xml->Parcel->NoteSpedizione );
-                return;
-            }
-
-            // Fase 5: Estrazione dati spedizione creata con successo
-            if ( isset( $xml->Parcel->NumeroSpedizione ) && ! empty( (string) $xml->Parcel->NumeroSpedizione ) ) {
-                $track = (string) $xml->Parcel->NumeroSpedizione;
-
-                // Salva il tracking number nei metadati dell'ordine
-                update_post_meta( $order->get_id(), '_gls_tracking_number', $track );
-
-                $note = 'Spedizione GLS creata con successo! Tracking: ' . $track;
-
-                // Se presente, salva l'etichetta PDF (codificata in Base64)
-                if ( isset( $xml->Parcel->PdfLabel ) && ! empty( (string) $xml->Parcel->PdfLabel ) ) {
-                    $upload_dir = wp_upload_dir();
-                    $pdf_path   = $upload_dir['path'] . '/GLS_Label_' . $track . '.pdf';
-                    $pdf_url    = $upload_dir['url'] . '/GLS_Label_' . $track . '.pdf';
-
-                    // Decodifica Base64 e salva il file PDF
-                    $pdf_content = base64_decode( (string) $xml->Parcel->PdfLabel );
-                    if ( $pdf_content !== false ) {
-                        file_put_contents( $pdf_path, $pdf_content );
-                        $note .= ' | <a href="' . esc_url( $pdf_url ) . '" target="_blank">Scarica Etichetta PDF</a>';
-                        // Salva anche l'URL del PDF nei metadati
-                        update_post_meta( $order->get_id(), '_gls_label_pdf_url', $pdf_url );
-                    }
-                }
-
-                $order->add_order_note( $note );
-                return;
-            }
+        // Fase 4: Controllo errore bloccante a livello Parcel
+        // <DescrizioneErrore> dentro <Parcel> = errore specifico del collo
+        if ( isset( $xml->Parcel->DescrizioneErrore ) && ! empty( (string) $xml->Parcel->DescrizioneErrore ) ) {
+            $order->add_order_note( 'Errore GLS (API): ' . (string) $xml->Parcel->DescrizioneErrore );
+            return;
         }
 
-        // Nessun dato riconosciuto nella risposta
-        $order->add_order_note( 'GLS Info: Nessun tracking trovato nella risposta. Struttura XML: ' . esc_html( substr( $inner_xml, 0, 500 ) ) );
+        // Fase 5: Estrazione NumeroSpedizione - IL CHECK PIÙ IMPORTANTE
+        // Ref: MU162 v30 sez. 5.1.4 - Il NumeroSpedizione è SEMPRE presente nella
+        // risposta InfoLabel, sia per spedizioni correttamente instradate sia per GLS CHECK.
+        // Anche in caso di GLS CHECK, è già un numero di tracking ufficiale GLS.
+        if ( isset( $xml->Parcel->NumeroSpedizione ) && ! empty( trim( (string) $xml->Parcel->NumeroSpedizione ) ) ) {
+            $track = trim( (string) $xml->Parcel->NumeroSpedizione );
+
+            // Salva il tracking number nei metadati dell'ordine
+            update_post_meta( $order->get_id(), '_gls_tracking_number', $track );
+
+            // Determina se è una spedizione GLS CHECK (routing fallito)
+            // Ref: MU162 v30 sez. 5.1.4 - DescrizioneSedeDestino = "GLS Check" per routing fallito
+            $sede_destino     = isset( $xml->Parcel->DescrizioneSedeDestino ) ? trim( (string) $xml->Parcel->DescrizioneSedeDestino ) : '';
+            $note_spedizione  = isset( $xml->Parcel->NoteSpedizione ) ? trim( (string) $xml->Parcel->NoteSpedizione ) : '';
+            $is_gls_check     = ( stripos( $sede_destino, 'GLS Check' ) !== false )
+                             || ( stripos( $note_spedizione, 'Dati non accettabili' ) !== false )
+                             || ( stripos( $note_spedizione, 'non conforme a stradario' ) !== false );
+
+            // Costruisci la nota ordine
+            if ( $is_gls_check ) {
+                // GLS CHECK: spedizione creata ma con routing da verificare alla sede
+                $note = '⚠️ Spedizione GLS creata come GLS CHECK. Tracking: ' . $track;
+                $note .= ' | Avviso GLS: ' . esc_html( $note_spedizione );
+                $note .= ' | La sede GLS correggerà automaticamente l\'instradamento.';
+            } else {
+                // Spedizione correttamente instradata
+                $note = '✅ Spedizione GLS creata con successo! Tracking: ' . $track;
+                if ( ! empty( $sede_destino ) ) {
+                    $note .= ' | Sede destino: ' . esc_html( $sede_destino );
+                }
+            }
+
+            // Se presente, salva l'etichetta PDF (codificata in Base64)
+            if ( isset( $xml->Parcel->PdfLabel ) && ! empty( (string) $xml->Parcel->PdfLabel ) ) {
+                $upload_dir = wp_upload_dir();
+                $pdf_path   = $upload_dir['path'] . '/GLS_Label_' . $track . '.pdf';
+                $pdf_url    = $upload_dir['url'] . '/GLS_Label_' . $track . '.pdf';
+
+                $pdf_content = base64_decode( (string) $xml->Parcel->PdfLabel );
+                if ( $pdf_content !== false && strlen( $pdf_content ) > 0 ) {
+                    file_put_contents( $pdf_path, $pdf_content );
+                    $note .= ' | <a href="' . esc_url( $pdf_url ) . '" target="_blank">Scarica Etichetta PDF</a>';
+                    update_post_meta( $order->get_id(), '_gls_label_pdf_url', $pdf_url );
+                }
+            }
+
+            $order->add_order_note( $note );
+            return;
+        }
+
+        // Fase 6: Nessun NumeroSpedizione trovato - questo è anomalo
+        // Logga il contenuto della risposta per diagnostica
+        $note_sped = isset( $xml->Parcel->NoteSpedizione ) ? (string) $xml->Parcel->NoteSpedizione : 'N/A';
+        $order->add_order_note(
+            'GLS Error: Nessun NumeroSpedizione nella risposta. '
+            . 'NoteSpedizione: ' . esc_html( $note_sped )
+            . ' | Struttura XML: ' . esc_html( substr( $inner_xml, 0, 800 ) )
+        );
     }
 
     /**
      * Estrae il contenuto XML reale dalla risposta ASMX.
      *
-     * I webservice ASP.NET (.asmx) wrappano la risposta in un tag <string>:
-     *   <string xmlns="http://tempuri.org/">&lt;Info&gt;...&lt;/Info&gt;</string>
+     * L'endpoint .asmx può restituire la risposta in due formati:
      *
-     * Questo metodo gestisce sia il caso wrappato che la risposta diretta.
+     * 1) Wrappata in <string> (tipico di HTTP POST via form-urlencoded):
+     *    <string xmlns="http://tempuri.org/">&lt;InfoLabel&gt;...&lt;/InfoLabel&gt;</string>
+     *
+     * 2) Diretta (già XML puro):
+     *    <InfoLabel xmlns="">...</InfoLabel>
+     *
+     * Ref: MU162 v30 sez. 5.1.4 - La risposta AddParcel ha root element <InfoLabel>.
      *
      * @param string $raw_response Risposta HTTP grezza
      * @return string XML pulito pronto per il parsing
      */
     private function extract_asmx_response( $raw_response ) {
+        // Rimuove eventuali BOM (Byte Order Mark) UTF-8 che possono precedere l'XML
+        $raw_response = ltrim( $raw_response, "\xEF\xBB\xBF" );
+
         // Prova a caricare come XML per verificare se è wrappato in <string>
         $wrapper = @simplexml_load_string( $raw_response );
 
         if ( $wrapper !== false ) {
-            // Se l'elemento root è <string> (namespace tempuri), estrai il contenuto testuale
             $root_name = $wrapper->getName();
+
+            // Caso 1: Wrappato in <string xmlns="http://tempuri.org/">
             if ( $root_name === 'string' ) {
-                // Il contenuto è HTML-encoded, simplexml lo decodifica automaticamente
                 $inner = (string) $wrapper;
                 if ( ! empty( $inner ) && strpos( $inner, '<' ) !== false ) {
                     return $inner;
                 }
             }
 
-            // Se l'elemento root è già <Info> o contiene <Parcel>, è già XML valido
-            if ( $root_name === 'Info' || isset( $wrapper->Parcel ) ) {
+            // Caso 2: Root è già InfoLabel o Info → risposta diretta, usala così com'è
+            if ( in_array( $root_name, array( 'InfoLabel', 'Info' ), true ) || isset( $wrapper->Parcel ) ) {
                 return $raw_response;
             }
         }
