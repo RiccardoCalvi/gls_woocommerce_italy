@@ -3,7 +3,7 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.0.6
+ * Version: 1.0.7
  * Author: Dream2Dev
  */
 
@@ -123,8 +123,10 @@ class GLS_WooCommerce_Integration_Advanced {
         register_setting( 'gls_settings_group', 'gls_codice_cliente' );
         register_setting( 'gls_settings_group', 'gls_password' );
         register_setting( 'gls_settings_group', 'gls_codice_contratto' );
+        register_setting( 'gls_settings_group', 'gls_vat_rate' );
         register_setting( 'gls_settings_group', 'gls_enable_cod' );
-        register_setting( 'gls_settings_group', 'gls_cod_fee_amount' ); 
+        register_setting( 'gls_settings_group', 'gls_cod_fee_percentage' ); 
+        register_setting( 'gls_settings_group', 'gls_cod_min_fee' ); 
     }
 
     public function settings_page_html() {
@@ -139,13 +141,26 @@ class GLS_WooCommerce_Integration_Advanced {
                     <tr><th scope="row">Codice Cliente</th><td><input type="text" name="gls_codice_cliente" value="<?php echo esc_attr( get_option( 'gls_codice_cliente' ) ); ?>" /></td></tr>
                     <tr><th scope="row">Password</th><td><input type="password" name="gls_password" value="<?php echo esc_attr( get_option( 'gls_password' ) ); ?>" /></td></tr>
                     <tr><th scope="row">Codice Contratto (Obbligatorio)</th><td><input type="text" name="gls_codice_contratto" value="<?php echo esc_attr( get_option( 'gls_codice_contratto' ) ); ?>" placeholder="Es. 0000" /></td></tr>
+                    
+                    <tr><th colspan="2"><hr><h3>Impostazioni Costi e Tasse</h3></th></tr>
+                    <tr>
+                        <th scope="row">Aliquota IVA Spedizioni (%)</th>
+                        <td>
+                            <input type="number" step="1" name="gls_vat_rate" value="<?php echo esc_attr( get_option( 'gls_vat_rate', '22' ) ); ?>" />
+                            <br><small>Questa percentuale verrà sommata in automatico ai costi netti di spedizione e di contrassegno mostrati al cliente nel carrello.</small>
+                        </td>
+                    </tr>
                     <tr>
                         <th scope="row">Abilita Trasmissione Contrassegno</th>
                         <td><label><input type="checkbox" name="gls_enable_cod" value="yes" <?php checked( get_option( 'gls_enable_cod' ), 'yes' ); ?> /> Trasmetti a GLS l'incasso del contrassegno (COD).</label></td>
                     </tr>
                     <tr>
-                        <th scope="row">Costo Contrassegno al Cliente (€)</th>
-                        <td><input type="number" step="0.01" name="gls_cod_fee_amount" value="<?php echo esc_attr( get_option( 'gls_cod_fee_amount', '5.00' ) ); ?>" /></td>
+                        <th scope="row">Percentuale Contrassegno (%)</th>
+                        <td><input type="number" step="0.1" name="gls_cod_fee_percentage" value="<?php echo esc_attr( get_option( 'gls_cod_fee_percentage', '2' ) ); ?>" /> <small>Dal contratto: 2%</small></td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Costo Minimo Contrassegno (€ netto)</th>
+                        <td><input type="number" step="0.01" name="gls_cod_min_fee" value="<?php echo esc_attr( get_option( 'gls_cod_min_fee', '5.00' ) ); ?>" /> <small>Dal contratto: minimo 5.00 €</small></td>
                     </tr>
                 </table>
                 <?php submit_button( 'Salva Impostazioni' ); ?>
@@ -214,7 +229,6 @@ class GLS_WooCommerce_Integration_Advanced {
         $xml = '<?xml version="1.0" encoding="utf-8"?><Info>';
         $xml .= '<SedeGls>' . esc_html( $sede ) . '</SedeGls><CodiceClienteGls>' . esc_html( $cliente ) . '</CodiceClienteGls><PasswordClienteGls>' . esc_html( $password ) . '</PasswordClienteGls><AddParcelResult>S</AddParcelResult><Parcel>';
         
-        // Formattazione forzata a 4 cifre per evitare l'errore di Contratto non valido
         if ( ! empty( $contratto ) || $contratto === '0' ) {
             $contratto_padded = str_pad( trim( $contratto ), 4, '0', STR_PAD_LEFT );
             $xml .= '<CodiceContrattoGls>' . esc_html( $contratto_padded ) . '</CodiceContrattoGls>';
@@ -288,7 +302,7 @@ function gls_custom_shipping_method_init() {
             public function __construct() {
                 $this->id = 'gls_contract_shipping';
                 $this->method_title = 'Corriere GLS (Contratto)';
-                $this->method_description = 'Calcola le tariffe in base agli scaglioni del contratto.';
+                $this->method_description = 'Calcola le tariffe in base agli scaglioni netti. L\'IVA verrà aggiunta in automatico.';
                 $this->availability = 'including'; $this->countries = array( 'IT' );
                 $this->init();
                 $this->enabled = isset( $this->settings['enabled'] ) ? $this->settings['enabled'] : 'yes';
@@ -303,17 +317,39 @@ function gls_custom_shipping_method_init() {
             public function init_form_fields() {
                 $this->form_fields = array(
                     'enabled' => array( 'title' => 'Abilita', 'type' => 'checkbox', 'default' => 'yes' ),
-                    'rate_0_3' => array( 'title' => 'Tariffa 0 - 3 Kg (€)', 'type' => 'number', 'default' => '5.80', 'custom_attributes' => array('step' => '0.01') ),
-                    'rate_3_5' => array( 'title' => 'Tariffa 3 - 5 Kg (€)', 'type' => 'number', 'default' => '6.30', 'custom_attributes' => array('step' => '0.01') ),
-                    'rate_5_10' => array( 'title' => 'Tariffa 5 - 10 Kg (€)', 'type' => 'number', 'default' => '6.90', 'custom_attributes' => array('step' => '0.01') ),
-                    'rate_10_20' => array( 'title' => 'Tariffa 10 - 20 Kg (€)', 'type' => 'number', 'default' => '7.70', 'custom_attributes' => array('step' => '0.01') ),
-                    'rate_20_30' => array( 'title' => 'Tariffa 20 - 30 Kg (€)', 'type' => 'number', 'default' => '8.60', 'custom_attributes' => array('step' => '0.01') ),
-                    'rate_30_50' => array( 'title' => 'Tariffa 30 - 50 Kg (€)', 'type' => 'number', 'default' => '11.50', 'custom_attributes' => array('step' => '0.01') ),
-                    'rate_50_70' => array( 'title' => 'Tariffa 50 - 70 Kg (€)', 'type' => 'number', 'default' => '16.50', 'custom_attributes' => array('step' => '0.01') ),
-                    'rate_70_100' => array( 'title' => 'Tariffa 70 - 100 Kg (€)', 'type' => 'number', 'default' => '20.50', 'custom_attributes' => array('step' => '0.01') ),
-                    'rate_extra' => array( 'title' => 'Extra (per ogni Kg >100) (€)', 'type' => 'number', 'default' => '0.22', 'custom_attributes' => array('step' => '0.01') ),
-                    'rate_islands' => array( 'title' => 'Maggiorazione Isole/Calabria fissa (€)', 'type' => 'number', 'default' => '1.00', 'custom_attributes' => array('step' => '0.01') ),
-                    'rate_minor_islands' => array( 'title' => 'Maggiorazione Isole Minori/Laguna (€)', 'type' => 'number', 'default' => '18.50', 'custom_attributes' => array('step' => '0.01') ),
+                    
+                    'title_it' => array( 'title' => 'Tariffe Base (Italia)', 'type' => 'title' ),
+                    'it_0_3' => array( 'title' => '0 - 3 Kg (€)', 'type' => 'number', 'default' => '4.90', 'custom_attributes' => array('step' => '0.01') ),
+                    'it_3_5' => array( 'title' => '3 - 5 Kg (€)', 'type' => 'number', 'default' => '5.50', 'custom_attributes' => array('step' => '0.01') ),
+                    'it_5_10' => array( 'title' => '5 - 10 Kg (€)', 'type' => 'number', 'default' => '9.00', 'custom_attributes' => array('step' => '0.01') ),
+                    'it_10_20' => array( 'title' => '10 - 20 Kg (€)', 'type' => 'number', 'default' => '10.50', 'custom_attributes' => array('step' => '0.01') ),
+                    'it_20_50' => array( 'title' => '20 - 50 Kg (€)', 'type' => 'number', 'default' => '16.50', 'custom_attributes' => array('step' => '0.01') ),
+                    'it_50_100' => array( 'title' => '50 - 100 Kg (€)', 'type' => 'number', 'default' => '25.00', 'custom_attributes' => array('step' => '0.01') ),
+                    'it_extra_50' => array( 'title' => 'Extra ogni 50Kg (fino a 500Kg) (€)', 'type' => 'number', 'default' => '16.50', 'custom_attributes' => array('step' => '0.01') ),
+                    'it_extra_100' => array( 'title' => 'Extra ogni 100Kg (oltre 500Kg) (€)', 'type' => 'number', 'default' => '40.00', 'custom_attributes' => array('step' => '0.01') ),
+
+                    'title_cs' => array( 'title' => 'Tariffe Calabria e Sicilia', 'type' => 'title' ),
+                    'cs_0_3' => array( 'title' => '0 - 3 Kg (€)', 'type' => 'number', 'default' => '5.20', 'custom_attributes' => array('step' => '0.01') ),
+                    'cs_3_5' => array( 'title' => '3 - 5 Kg (€)', 'type' => 'number', 'default' => '6.50', 'custom_attributes' => array('step' => '0.01') ),
+                    'cs_5_10' => array( 'title' => '5 - 10 Kg (€)', 'type' => 'number', 'default' => '13.00', 'custom_attributes' => array('step' => '0.01') ),
+                    'cs_10_20' => array( 'title' => '10 - 20 Kg (€)', 'type' => 'number', 'default' => '16.00', 'custom_attributes' => array('step' => '0.01') ),
+                    'cs_20_50' => array( 'title' => '20 - 50 Kg (€)', 'type' => 'number', 'default' => '22.00', 'custom_attributes' => array('step' => '0.01') ),
+                    'cs_50_100' => array( 'title' => '50 - 100 Kg (€)', 'type' => 'number', 'default' => '34.00', 'custom_attributes' => array('step' => '0.01') ),
+                    'cs_extra_50' => array( 'title' => 'Extra ogni 50Kg (fino a 500Kg) (€)', 'type' => 'number', 'default' => '22.00', 'custom_attributes' => array('step' => '0.01') ),
+                    'cs_extra_100' => array( 'title' => 'Extra ogni 100Kg (oltre 500Kg) (€)', 'type' => 'number', 'default' => '40.00', 'custom_attributes' => array('step' => '0.01') ),
+
+                    'title_sa' => array( 'title' => 'Tariffe Sardegna', 'type' => 'title' ),
+                    'sa_0_3' => array( 'title' => '0 - 3 Kg (€)', 'type' => 'number', 'default' => '5.50', 'custom_attributes' => array('step' => '0.01') ),
+                    'sa_3_5' => array( 'title' => '3 - 5 Kg (€)', 'type' => 'number', 'default' => '7.00', 'custom_attributes' => array('step' => '0.01') ),
+                    'sa_5_10' => array( 'title' => '5 - 10 Kg (€)', 'type' => 'number', 'default' => '13.00', 'custom_attributes' => array('step' => '0.01') ),
+                    'sa_10_20' => array( 'title' => '10 - 20 Kg (€)', 'type' => 'number', 'default' => '16.00', 'custom_attributes' => array('step' => '0.01') ),
+                    'sa_20_50' => array( 'title' => '20 - 50 Kg (€)', 'type' => 'number', 'default' => '22.00', 'custom_attributes' => array('step' => '0.01') ),
+                    'sa_50_100' => array( 'title' => '50 - 100 Kg (€)', 'type' => 'number', 'default' => '34.00', 'custom_attributes' => array('step' => '0.01') ),
+                    'sa_extra_50' => array( 'title' => 'Extra ogni 50Kg (fino a 500Kg) (€)', 'type' => 'number', 'default' => '22.00', 'custom_attributes' => array('step' => '0.01') ),
+                    'sa_extra_100' => array( 'title' => 'Extra ogni 100Kg (oltre 500Kg) (€)', 'type' => 'number', 'default' => '40.00', 'custom_attributes' => array('step' => '0.01') ),
+
+                    'title_other' => array( 'title' => 'Altre Maggiorazioni', 'type' => 'title' ),
+                    'minor_islands' => array( 'title' => 'Maggiorazione Isole Minori/Laguna (ogni 100Kg) (€)', 'type' => 'number', 'default' => '18.50', 'custom_attributes' => array('step' => '0.01') ),
                 );
             }
 
@@ -324,34 +360,48 @@ function gls_custom_shipping_method_init() {
                 $state = $package['destination']['state'];
                 $postcode = $package['destination']['postcode'];
                 
-                $cost = 0;
-                
-                if ( $weight <= 3 ) $cost = (float) $this->get_option( 'rate_0_3' );
-                elseif ( $weight <= 5 ) $cost = (float) $this->get_option( 'rate_3_5' );
-                elseif ( $weight <= 10 ) $cost = (float) $this->get_option( 'rate_5_10' );
-                elseif ( $weight <= 20 ) $cost = (float) $this->get_option( 'rate_10_20' );
-                elseif ( $weight <= 30 ) $cost = (float) $this->get_option( 'rate_20_30' );
-                elseif ( $weight <= 50 ) $cost = (float) $this->get_option( 'rate_30_50' );
-                elseif ( $weight <= 70 ) $cost = (float) $this->get_option( 'rate_50_70' );
-                elseif ( $weight <= 100 ) $cost = (float) $this->get_option( 'rate_70_100' );
-                else {
-                    $base_100 = (float) $this->get_option( 'rate_70_100' );
-                    $extra_rate = (float) $this->get_option( 'rate_extra' );
-                    $cost = $base_100 + ( ceil( $weight - 100 ) * $extra_rate );
+                $calabria_sicilia = array( 'CZ', 'CS', 'KR', 'RC', 'VV', 'AG', 'CL', 'CT', 'EN', 'ME', 'PA', 'RG', 'SR', 'TP' );
+                $sardegna = array( 'CA', 'NU', 'OR', 'SS', 'SU' );
+
+                if ( in_array( $state, $calabria_sicilia ) ) {
+                    $prefix = 'cs_';
+                } elseif ( in_array( $state, $sardegna ) ) {
+                    $prefix = 'sa_';
+                } else {
+                    $prefix = 'it_';
                 }
 
-                $islands = array( 'AG','CL','CT','EN','ME','PA','RG','SR','TP', 'CA','NU','OR','SS','SU', 'CZ','CS','KR','RC','VV' );
-                if ( in_array( $state, $islands ) ) {
-                    $cost += (float) $this->get_option( 'rate_islands' );
-                    if ( $weight > 100 ) $cost += ( ceil( $weight - 100 ) * 0.02 );
+                $cost = 0;
+                
+                if ( $weight <= 3 ) $cost = (float) $this->get_option( $prefix . '0_3' );
+                elseif ( $weight <= 5 ) $cost = (float) $this->get_option( $prefix . '3_5' );
+                elseif ( $weight <= 10 ) $cost = (float) $this->get_option( $prefix . '5_10' );
+                elseif ( $weight <= 20 ) $cost = (float) $this->get_option( $prefix . '10_20' );
+                elseif ( $weight <= 50 ) $cost = (float) $this->get_option( $prefix . '20_50' );
+                elseif ( $weight <= 100 ) $cost = (float) $this->get_option( $prefix . '50_100' );
+                elseif ( $weight <= 500 ) {
+                    $base = (float) $this->get_option( $prefix . '50_100' );
+                    $extra = (float) $this->get_option( $prefix . 'extra_50' );
+                    $cost = $base + ( ceil( ($weight - 100) / 50 ) * $extra );
+                } else {
+                    $base = (float) $this->get_option( $prefix . '50_100' );
+                    $extra_50 = (float) $this->get_option( $prefix . 'extra_50' );
+                    $extra_100 = (float) $this->get_option( $prefix . 'extra_100' );
+                    // 400kg di intervallo a scaglioni di 50 = 8 scaglioni
+                    $cost = $base + ( 8 * $extra_50 ) + ( ceil( ($weight - 500) / 100 ) * $extra_100 );
                 }
 
                 $venice_islands = array( '30121','30122','30123','30124','30125','30126','30132','30133','30141','80073','80074','80075','80076','80077' ); 
                 if ( in_array( $postcode, $venice_islands ) ) {
-                    $cost += (float) $this->get_option( 'rate_minor_islands' );
+                    $minor_rate = (float) $this->get_option( 'minor_islands' );
+                    $cost += ( ceil( $weight / 100 ) * $minor_rate );
                 }
 
-                $this->add_rate( array( 'id' => $this->id, 'label' => $this->title, 'cost' => $cost ) );
+                // Applica in automatico l'IVA al costo calcolato
+                $vat_rate = (float) get_option( 'gls_vat_rate', '22' );
+                $cost_with_vat = $cost * ( 1 + ( $vat_rate / 100 ) );
+
+                $this->add_rate( array( 'id' => $this->id, 'label' => $this->title, 'cost' => $cost_with_vat ) );
             }
         }
     }
@@ -378,8 +428,21 @@ function gls_add_cod_fee( $cart ) {
     }
     
     if ( 'cod' === $chosen_payment_method ) {
-        $fee = (float) get_option( 'gls_cod_fee_amount', '5.00' );
-        $cart->add_fee( 'Supplemento Contrassegno GLS', $fee, false ); 
+        $percentage = (float) get_option( 'gls_cod_fee_percentage', '2' );
+        $min_fee = (float) get_option( 'gls_cod_min_fee', '5.00' );
+        $vat_rate = (float) get_option( 'gls_vat_rate', '22' );
+        
+        // Calcola il costo totale dell'ordine fino a questo momento (Carrello + Spedizione)
+        $cart_total = $cart->get_cart_contents_total() + $cart->get_shipping_total();
+        
+        // Calcola la fee base: Il massimo tra il minimo fisso e la percentuale
+        $base_fee = max( $min_fee, $cart_total * ($percentage / 100) );
+        
+        // Aggiungi l'IVA
+        $fee_with_vat = $base_fee * ( 1 + ( $vat_rate / 100 ) );
+        
+        // False = diciamo a WooCommerce di NON aggiungere ulteriori tasse su questo importo
+        $cart->add_fee( 'Supplemento Contrassegno GLS', $fee_with_vat, false ); 
     }
 }
 
