@@ -936,7 +936,7 @@ class GLS_WooCommerce_Integration_Advanced {
 
         $tracking_url = 'https://gls-group.eu/track/' . urlencode( $tracking );
         ?>
-        <section class="woocommerce-gls-tracking" style="margin-top:2em; padding:1em 1.5em; background:#f8f8f8; border-left:4px solid #e2001a;">
+        <section class="woocommerce-gls-tracking" style="margin:2em 0; padding:1em 1.5em; background:#f8f8f8; border-left:4px solid #f2c200;">
             <h2 style="font-size:1em; margin:0 0 0.5em; color:#333;">
                 <?php esc_html_e( 'Informazioni di Spedizione GLS', 'woocommerce' ); ?>
             </h2>
@@ -947,12 +947,12 @@ class GLS_WooCommerce_Integration_Advanced {
                 <strong><?php esc_html_e( 'Codice di tracking:', 'woocommerce' ); ?></strong>
                 &nbsp;
                 <a href="<?php echo esc_url( $tracking_url ); ?>" target="_blank" rel="noopener noreferrer"
-                   style="color:#e2001a; font-weight:bold; font-size:1.1em;">
+                   style="color:#f2c200; font-weight:bold; font-size:1.1em;">
                     <?php echo esc_html( $tracking ); ?>
                 </a>
                 &nbsp;
                 <a href="<?php echo esc_url( $tracking_url ); ?>" target="_blank" rel="noopener noreferrer"
-                   style="display:inline-block; margin-left:0.5em; padding:0.3em 0.8em; background:#e2001a; color:#fff; border-radius:3px; text-decoration:none; font-size:0.85em;">
+                   style="display: inline-block; margin-left: 0.5em; padding: 15px 30px 15px 30px; background: #f2c200; color: #fff;">
                     <?php esc_html_e( 'Traccia spedizione →', 'woocommerce' ); ?>
                 </a>
             </p>
