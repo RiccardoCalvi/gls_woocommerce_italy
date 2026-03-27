@@ -3,12 +3,33 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.3.0
+ * Version: 1.3.1
  * Author: Dream2Dev
  * Requires at least: 5.8
  * Tested up to: 6.7
  * WC requires at least: 7.0
  * WC tested up to: 9.6
+ *
+ * Changelog v1.3.1:
+ *   - Fix DeleteSped HTTP 500: riscritto completamente il metodo cancel_gls_shipment
+ *     con strategia di chiamata a 2 livelli di fallback.
+ *     Livello 1: HTTP POST form-encoded con 3 nomi parametro tentati in sequenza
+ *       (XMLInfoSped → XMLInfo → XMLInfoDelete). La doc MU162 §5.4 non specifica
+ *       il nome del parametro HTTP per DeleteSped, a differenza di AddParcel (XMLInfoParcel)
+ *       e CloseWorkDay (XMLInfo). Il vecchio codice provava solo XMLInfo e XMLInfoSped.
+ *     Livello 2: SOAP 1.1 fallback — se tutti i tentativi HTTP POST restituiscono 500,
+ *       il plugin invia una richiesta SOAP 1.1 all'endpoint base ilswebservice.asmx
+ *       con SOAPAction "https://labelservice.gls-italy.com/DeleteSped".
+ *       SOAP bypassa completamente il problema del nome parametro HTTP perché la
+ *       struttura è definita dal WSDL del servizio.
+ *   - Nuovo metodo delete_sped_soap(): implementa la chiamata SOAP 1.1 con envelope
+ *     standard e parsing della risposta <DeleteSpedResult> dall'envelope di ritorno.
+ *   - Nuovo metodo extract_soap_response(): estrae il contenuto dal wrapper SOAP,
+ *     gestendo sia risposte normali (<*Result>) sia SOAP Fault (<faultstring>).
+ *   - Fix: errore di rete su un tentativo non blocca più i tentativi successivi
+ *     (il vecchio codice faceva "return" immediato al primo errore di rete).
+ *   - Migliorato logging: ogni tentativo (HTTP POST e SOAP) logga separatamente
+ *     parametro usato, HTTP code e snippet della risposta per facilitare la diagnosi.
  *
  * Changelog v1.3.0:
  *   - HPOS (High-Performance Order Storage): piena compatibilità con il nuovo storage ordini
@@ -1099,6 +1120,17 @@ class GLS_WooCommerce_Integration_Advanced {
     /**
      * Cancella la spedizione GLS quando un ordine WooCommerce viene annullato.
      *
+     * STRATEGIA DI CHIAMATA (Ref: MU162 §5.4):
+     * La doc non specifica il nome del parametro HTTP POST per DeleteSped.
+     * L'endpoint .asmx supporta sia HTTP POST form-encoded sia SOAP 1.1/1.2.
+     * Per massimizzare la compatibilità usiamo 3 livelli di fallback:
+     *
+     *   Livello 1: HTTP POST form-encoded con nomi parametro probabili
+     *              (XMLInfoSped, XMLInfo, XMLInfoDelete) — veloce e leggero
+     *   Livello 2: SOAP 1.1 — chiamata all'endpoint base .asmx con envelope SOAP
+     *              Questo bypassa completamente il problema del nome parametro HTTP
+     *              perché il parametro è definito nel WSDL del servizio.
+     *
      * @param int $order_id ID dell'ordine WooCommerce annullato
      */
     public function cancel_gls_shipment( $order_id ) {
@@ -1124,6 +1156,7 @@ class GLS_WooCommerce_Integration_Advanced {
         }
 
         // Costruisce l'XML per DeleteSped (Ref: MU162 §5.4)
+        // La struttura root è <DeleteSped>, NON <Info> come per AddParcel/CloseWorkDay.
         $xml  = '<DeleteSped>';
         $xml .= '<SedeGls>' . esc_html( $sede ) . '</SedeGls>';
         $xml .= '<CodiceClienteGls>' . esc_html( $cliente ) . '</CodiceClienteGls>';
@@ -1133,13 +1166,18 @@ class GLS_WooCommerce_Integration_Advanced {
 
         // Log di debug in error_log (password mascherata)
         $xml_log = str_replace( esc_html( $password ), '***', $xml );
-        error_log( 'GLS DeleteSped XML sent order #' . $order_id . ': ' . $xml_log );
+        error_log( 'GLS DeleteSped XML order #' . $order_id . ': ' . $xml_log );
 
-        // Prova prima con "XMLInfo", poi con "XMLInfoSped" come fallback
-        $param_names = array( 'XMLInfo', 'XMLInfoSped' );
-        $response    = null;
-        $http_code   = 0;
-        $body        = '';
+        // --- LIVELLO 1: HTTP POST form-encoded con nomi parametro multipli ---
+        // La doc MU162 non specifica il parametro per DeleteSped.
+        // Proviamo i nomi più probabili basandoci sul pattern:
+        //   AddParcel → XMLInfoParcel
+        //   CloseWorkDay → XMLInfo
+        //   DeleteSped → XMLInfoSped (probabile) / XMLInfo (fallback)
+        $http_post_success = false;
+        $param_names       = array( 'XMLInfoSped', 'XMLInfo', 'XMLInfoDelete' );
+        $http_code         = 0;
+        $body              = '';
 
         foreach ( $param_names as $param_name ) {
             $response = wp_remote_post( $this->api_url_deletesped, array(
@@ -1149,39 +1187,69 @@ class GLS_WooCommerce_Integration_Advanced {
             ) );
 
             if ( is_wp_error( $response ) ) {
-                $order->add_order_note(
-                    'GLS Error di rete durante la cancellazione spedizione ' . $tracking . ': '
-                    . $response->get_error_message() . '. Contatta manualmente la sede GLS.'
-                );
-                error_log( 'GLS DeleteSped network error order #' . $order_id . ': ' . $response->get_error_message() );
-                return;
+                error_log( 'GLS DeleteSped network error param="' . $param_name . '" order #' . $order_id . ': ' . $response->get_error_message() );
+                continue; // Prova il prossimo parametro
             }
 
             $http_code = wp_remote_retrieve_response_code( $response );
             $body      = wp_remote_retrieve_body( $response );
 
-            error_log( 'GLS DeleteSped param="' . $param_name . '" HTTP ' . $http_code . ' order #' . $order_id . ': ' . substr( $body, 0, 300 ) );
+            error_log( 'GLS DeleteSped HTTP POST param="' . $param_name . '" HTTP ' . $http_code . ' order #' . $order_id . ': ' . substr( $body, 0, 300 ) );
 
+            // Se non è un 500 (errore server = parametro errato), abbiamo trovato il parametro giusto
             if ( $http_code !== 500 ) {
+                $http_post_success = true;
                 break;
             }
         }
 
-        // Gestione HTTP 500
-        if ( $http_code === 500 ) {
+        // --- LIVELLO 2: SOAP 1.1 fallback ---
+        // Se tutti i tentativi HTTP POST restituiscono 500, è probabile che:
+        // (a) Il metodo non è esposto via HTTP POST form-encoded, oppure
+        // (b) Il nome del parametro non è tra quelli provati.
+        // SOAP 1.1 bypassa il problema: il parametro è definito nel WSDL.
+        // L'endpoint SOAP è l'URL base senza /MethodName.
+        if ( ! $http_post_success && $http_code === 500 ) {
+            error_log( 'GLS DeleteSped: tutti i tentativi HTTP POST falliti con 500. Provo SOAP 1.1...' );
+
+            $soap_result = $this->delete_sped_soap( $xml, $order_id );
+
+            if ( $soap_result !== false ) {
+                $http_code = $soap_result['http_code'];
+                $body      = $soap_result['body'];
+                $http_post_success = ( $http_code === 200 );
+
+                error_log( 'GLS DeleteSped SOAP HTTP ' . $http_code . ' order #' . $order_id . ': ' . substr( $body, 0, 300 ) );
+            }
+        }
+
+        // --- Gestione errori di rete (nessuna risposta utilizzabile) ---
+        if ( ! $http_post_success && $http_code === 0 ) {
             $order->add_order_note(
-                '⚠️ GLS: Il server ha restituito HTTP 500 durante la cancellazione della spedizione ' . $tracking . '. '
-                . 'Possibili cause: (1) la funzione DeleteSped non è abilitata per questo account, '
-                . '(2) si sta usando un\'etichetta di test non cancellabile via webservice. '
-                . 'Contatta la sede GLS per procedere manualmente. '
-                . 'Il tracking è stato rimosso dall\'ordine.'
+                'GLS Error di rete durante la cancellazione spedizione ' . $tracking . '. '
+                . 'Nessun tentativo ha avuto successo. Contatta manualmente la sede GLS.'
             );
-            // Rimuove comunque il tracking (HPOS-compatible)
-            $this->delete_order_meta( $order, array( '_gls_tracking_number', 'gls_tracking_number', '_gls_label_pdf_url' ) );
-            error_log( 'GLS DeleteSped HTTP 500 body order #' . $order_id . ': ' . substr( $body, 0, 500 ) );
             return;
         }
 
+        // --- Gestione HTTP 500 persistente (anche SOAP fallito) ---
+        if ( $http_code === 500 ) {
+            $order->add_order_note(
+                '⚠️ GLS: Il server ha restituito HTTP 500 durante la cancellazione della spedizione ' . $tracking . '. '
+                . 'Tutti i metodi di chiamata (HTTP POST e SOAP) hanno fallito. '
+                . 'Possibili cause: (1) la funzione DeleteSped non è abilitata per questo account GLS, '
+                . '(2) l\'ambiente di test GLS non espone il metodo DeleteSped, '
+                . '(3) la spedizione non è cancellabile da webservice. '
+                . 'Contatta la sede GLS per procedere manualmente alla cancellazione. '
+                . 'Il tracking è stato rimosso dall\'ordine.'
+            );
+            // Rimuove comunque il tracking dall'ordine per evitare doppi tentativi (HPOS-compatible)
+            $this->delete_order_meta( $order, array( '_gls_tracking_number', 'gls_tracking_number', '_gls_label_pdf_url' ) );
+            error_log( 'GLS DeleteSped HTTP 500 persistente (POST+SOAP) order #' . $order_id . ': ' . substr( $body, 0, 500 ) );
+            return;
+        }
+
+        // --- Gestione altri errori HTTP ---
         if ( $http_code !== 200 ) {
             $order->add_order_note(
                 'GLS HTTP Error ' . $http_code . ' durante la cancellazione spedizione ' . $tracking . '. Contatta manualmente la sede GLS.'
@@ -1189,8 +1257,128 @@ class GLS_WooCommerce_Integration_Advanced {
             return;
         }
 
-        // Parsing della risposta
+        // --- Parsing della risposta ---
         $this->parse_delete_sped_response( $body, $order, $tracking );
+    }
+
+    /**
+     * Esegue la chiamata DeleteSped tramite SOAP 1.1.
+     *
+     * Fallback quando HTTP POST form-encoded restituisce 500 per tutti
+     * i nomi parametro tentati. SOAP non dipende dal nome parametro HTTP
+     * perché la struttura è definita dal WSDL del servizio.
+     *
+     * L'endpoint SOAP è l'URL base del webservice (senza /MethodName).
+     * La SOAPAction è tipicamente: "https://labelservice.gls-italy.com/DeleteSped"
+     *
+     * Proviamo due strutture SOAP:
+     *   1) Parametro SOAP "XMLInfoSped" contenente l'XML come stringa
+     *   2) Parametro SOAP "XMLInfo" contenente l'XML come stringa
+     *
+     * @param string $xml      XML DeleteSped da inviare
+     * @param int    $order_id ID ordine per logging
+     * @return array|false Array con 'http_code' e 'body', o false in caso di errore rete
+     */
+    private function delete_sped_soap( $xml, $order_id ) {
+        // URL base del webservice (senza /DeleteSped)
+        $soap_url = 'https://labelservice.gls-italy.com/ilswebservice.asmx';
+
+        // SOAPAction tipica per endpoint .asmx — namespace + metodo
+        $soap_action = 'https://labelservice.gls-italy.com/DeleteSped';
+
+        // Nomi parametro da provare nella busta SOAP
+        // In ASMX, il nome dell'elemento dentro <soap:Body>/<MethodName> corrisponde
+        // al parametro del metodo .NET (lo stesso usato per HTTP POST).
+        $soap_param_names = array( 'XMLInfoSped', 'XMLInfo' );
+
+        foreach ( $soap_param_names as $soap_param ) {
+            // L'XML va inserito come stringa testo (entità HTML escaped) dentro il parametro SOAP.
+            // L'ASMX si aspetta una stringa XML, non XML nidificato direttamente.
+            $xml_escaped = htmlspecialchars( $xml, ENT_XML1, 'UTF-8' );
+
+            $soap_envelope  = '<?xml version="1.0" encoding="utf-8"?>';
+            $soap_envelope .= '<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ';
+            $soap_envelope .= 'xmlns:xsd="http://www.w3.org/2001/XMLSchema" ';
+            $soap_envelope .= 'xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">';
+            $soap_envelope .= '<soap:Body>';
+            $soap_envelope .= '<DeleteSped xmlns="https://labelservice.gls-italy.com/">';
+            $soap_envelope .= '<' . $soap_param . '>' . $xml_escaped . '</' . $soap_param . '>';
+            $soap_envelope .= '</DeleteSped>';
+            $soap_envelope .= '</soap:Body>';
+            $soap_envelope .= '</soap:Envelope>';
+
+            $response = wp_remote_post( $soap_url, array(
+                'method'  => 'POST',
+                'timeout' => 30,
+                'headers' => array(
+                    'Content-Type' => 'text/xml; charset=utf-8',
+                    'SOAPAction'   => '"' . $soap_action . '"',
+                ),
+                'body' => $soap_envelope,
+            ) );
+
+            if ( is_wp_error( $response ) ) {
+                error_log( 'GLS DeleteSped SOAP network error param="' . $soap_param . '" order #' . $order_id . ': ' . $response->get_error_message() );
+                continue;
+            }
+
+            $http_code = wp_remote_retrieve_response_code( $response );
+            $body      = wp_remote_retrieve_body( $response );
+
+            error_log( 'GLS DeleteSped SOAP param="' . $soap_param . '" HTTP ' . $http_code . ' order #' . $order_id . ': ' . substr( $body, 0, 400 ) );
+
+            // Se la risposta SOAP non è un 500, estraiamo il contenuto utile
+            if ( $http_code !== 500 ) {
+                // La risposta SOAP wrappa il contenuto in <soap:Body>/<DeleteSpedResponse>/<DeleteSpedResult>
+                // Proviamo a estrarre il testo utile dall'envelope SOAP
+                $extracted = $this->extract_soap_response( $body );
+                return array(
+                    'http_code' => $http_code,
+                    'body'      => $extracted,
+                );
+            }
+        }
+
+        // Tutti i tentativi SOAP falliti
+        return false;
+    }
+
+    /**
+     * Estrae il contenuto utile da una risposta SOAP.
+     *
+     * La risposta SOAP di un metodo .asmx è tipicamente:
+     *   <soap:Envelope>
+     *     <soap:Body>
+     *       <DeleteSpedResponse xmlns="...">
+     *         <DeleteSpedResult>testo_risultato</DeleteSpedResult>
+     *       </DeleteSpedResponse>
+     *     </soap:Body>
+     *   </soap:Envelope>
+     *
+     * Il testo dentro <DeleteSpedResult> può essere XML escaped o testo semplice.
+     *
+     * @param string $soap_response Risposta SOAP completa
+     * @return string Contenuto estratto, o la risposta originale se non parsabile
+     */
+    private function extract_soap_response( $soap_response ) {
+        // Rimuove namespace per facilitare il parsing
+        // Prova a trovare il tag *Result dentro la risposta
+        if ( preg_match( '/<\w*Result[^>]*>(.*?)<\/\w*Result>/s', $soap_response, $matches ) ) {
+            $result = $matches[1];
+            // Se il contenuto è HTML-escaped, decodificalo
+            if ( strpos( $result, '&lt;' ) !== false ) {
+                $result = html_entity_decode( $result, ENT_QUOTES, 'UTF-8' );
+            }
+            return $result;
+        }
+
+        // Prova a trovare un <soap:Fault> per errori SOAP
+        if ( preg_match( '/<faultstring[^>]*>(.*?)<\/faultstring>/s', $soap_response, $matches ) ) {
+            return 'SOAP Fault: ' . $matches[1];
+        }
+
+        // Fallback: restituisci la risposta come è
+        return $soap_response;
     }
 
     /**
