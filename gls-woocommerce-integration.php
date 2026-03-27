@@ -3,7 +3,7 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.0.7
+ * Version: 1.0.8
  * Author: Dream2Dev
  */
 
@@ -124,6 +124,7 @@ class GLS_WooCommerce_Integration_Advanced {
         register_setting( 'gls_settings_group', 'gls_password' );
         register_setting( 'gls_settings_group', 'gls_codice_contratto' );
         register_setting( 'gls_settings_group', 'gls_vat_rate' );
+        register_setting( 'gls_settings_group', 'gls_free_shipping_threshold' ); // Nuovo parametro
         register_setting( 'gls_settings_group', 'gls_enable_cod' );
         register_setting( 'gls_settings_group', 'gls_cod_fee_percentage' ); 
         register_setting( 'gls_settings_group', 'gls_cod_min_fee' ); 
@@ -147,20 +148,29 @@ class GLS_WooCommerce_Integration_Advanced {
                         <th scope="row">Aliquota IVA Spedizioni (%)</th>
                         <td>
                             <input type="number" step="1" name="gls_vat_rate" value="<?php echo esc_attr( get_option( 'gls_vat_rate', '22' ) ); ?>" />
-                            <br><small>Questa percentuale verrà sommata in automatico ai costi netti di spedizione e di contrassegno mostrati al cliente nel carrello.</small>
+                            <br><small>Questa percentuale verrà sommata in automatico ai costi netti di spedizione e di contrassegno.</small>
                         </td>
                     </tr>
                     <tr>
+                        <th scope="row">Soglia Spedizione Gratuita (€)</th>
+                        <td>
+                            <input type="number" step="0.01" name="gls_free_shipping_threshold" value="<?php echo esc_attr( get_option( 'gls_free_shipping_threshold', '0' ) ); ?>" />
+                            <br><small>Imposta a 0 per disabilitare. Se il totale del carrello (tasse incluse) supera questa soglia, la spedizione sarà gratuita (il contrassegno, se scelto, verrà comunque addebitato).</small>
+                        </td>
+                    </tr>
+
+                    <tr><th colspan="2"><hr><h3>Impostazioni Contrassegno (COD)</h3></th></tr>
+                    <tr>
                         <th scope="row">Abilita Trasmissione Contrassegno</th>
-                        <td><label><input type="checkbox" name="gls_enable_cod" value="yes" <?php checked( get_option( 'gls_enable_cod' ), 'yes' ); ?> /> Trasmetti a GLS l'incasso del contrassegno (COD).</label></td>
+                        <td><label><input type="checkbox" name="gls_enable_cod" value="yes" <?php checked( get_option( 'gls_enable_cod' ), 'yes' ); ?> /> Trasmetti a GLS l'incasso del contrassegno se il cliente lo sceglie al checkout.</label></td>
                     </tr>
                     <tr>
                         <th scope="row">Percentuale Contrassegno (%)</th>
-                        <td><input type="number" step="0.1" name="gls_cod_fee_percentage" value="<?php echo esc_attr( get_option( 'gls_cod_fee_percentage', '2' ) ); ?>" /> <small>Dal contratto: 2%</small></td>
+                        <td><input type="number" step="0.1" name="gls_cod_fee_percentage" value="<?php echo esc_attr( get_option( 'gls_cod_fee_percentage', '2' ) ); ?>" /></td>
                     </tr>
                     <tr>
                         <th scope="row">Costo Minimo Contrassegno (€ netto)</th>
-                        <td><input type="number" step="0.01" name="gls_cod_min_fee" value="<?php echo esc_attr( get_option( 'gls_cod_min_fee', '5.00' ) ); ?>" /> <small>Dal contratto: minimo 5.00 €</small></td>
+                        <td><input type="number" step="0.01" name="gls_cod_min_fee" value="<?php echo esc_attr( get_option( 'gls_cod_min_fee', '5.00' ) ); ?>" /></td>
                     </tr>
                 </table>
                 <?php submit_button( 'Salva Impostazioni' ); ?>
@@ -387,7 +397,6 @@ function gls_custom_shipping_method_init() {
                     $base = (float) $this->get_option( $prefix . '50_100' );
                     $extra_50 = (float) $this->get_option( $prefix . 'extra_50' );
                     $extra_100 = (float) $this->get_option( $prefix . 'extra_100' );
-                    // 400kg di intervallo a scaglioni di 50 = 8 scaglioni
                     $cost = $base + ( 8 * $extra_50 ) + ( ceil( ($weight - 500) / 100 ) * $extra_100 );
                 }
 
@@ -400,6 +409,15 @@ function gls_custom_shipping_method_init() {
                 // Applica in automatico l'IVA al costo calcolato
                 $vat_rate = (float) get_option( 'gls_vat_rate', '22' );
                 $cost_with_vat = $cost * ( 1 + ( $vat_rate / 100 ) );
+
+                // Controlla se è stata superata la soglia di spedizione gratuita
+                $free_threshold = (float) get_option( 'gls_free_shipping_threshold', '0' );
+                // Calcola il totale del carrello per i prodotti, comprensivo di IVA (inclusi eventuali sconti applicati)
+                $cart_total_for_threshold = WC()->cart->get_cart_contents_total() + WC()->cart->get_cart_contents_tax();
+
+                if ( $free_threshold > 0 && $cart_total_for_threshold >= $free_threshold ) {
+                    $cost_with_vat = 0; // Azzera il costo di spedizione
+                }
 
                 $this->add_rate( array( 'id' => $this->id, 'label' => $this->title, 'cost' => $cost_with_vat ) );
             }
@@ -432,16 +450,10 @@ function gls_add_cod_fee( $cart ) {
         $min_fee = (float) get_option( 'gls_cod_min_fee', '5.00' );
         $vat_rate = (float) get_option( 'gls_vat_rate', '22' );
         
-        // Calcola il costo totale dell'ordine fino a questo momento (Carrello + Spedizione)
         $cart_total = $cart->get_cart_contents_total() + $cart->get_shipping_total();
-        
-        // Calcola la fee base: Il massimo tra il minimo fisso e la percentuale
         $base_fee = max( $min_fee, $cart_total * ($percentage / 100) );
-        
-        // Aggiungi l'IVA
         $fee_with_vat = $base_fee * ( 1 + ( $vat_rate / 100 ) );
         
-        // False = diciamo a WooCommerce di NON aggiungere ulteriori tasse su questo importo
         $cart->add_fee( 'Supplemento Contrassegno GLS', $fee_with_vat, false ); 
     }
 }
