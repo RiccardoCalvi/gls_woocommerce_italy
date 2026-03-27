@@ -3,8 +3,20 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.2.2
+ * Version: 1.2.3
  * Author: Dream2Dev
+ *
+ * Changelog v1.2.3:
+ *   - Fix email tracking: sostituito lo shortcode [gls_tracking_number] (non processato da YayMail)
+ *     con variabili native YayMail registrate tramite il filtro yaymail_custom_variables.
+ *     Nel builder YayMail sono ora disponibili due variabili drag-and-drop:
+ *       {{gls_tracking_number}} — codice tracking testuale (es. 661209312)
+ *       {{gls_tracking_link}}   — link HTML cliccabile con stile GLS
+ *     Le variabili funzionano su tutte le email WooCommerce (ordine completato, cambio stato, ecc.)
+ *     Lo shortcode [gls_tracking_number] è mantenuto per compatibilità con altri contesti.
+ *   - Aggiunto: salvataggio tracking in meta "visibile" gls_tracking_number (senza prefisso _)
+ *     in aggiunta al meta privato _gls_tracking_number, così appare nella metabox
+ *     "Campi personalizzati" del backend WooCommerce.
  *
  * Changelog v1.2.2:
  *   - Fix shortcode [gls_tracking_number]: lo shortcode non funzionava nelle email WooCommerce
@@ -697,8 +709,13 @@ class GLS_WooCommerce_Integration_Advanced {
         if ( isset( $xml->Parcel->NumeroSpedizione ) && ! empty( trim( (string) $xml->Parcel->NumeroSpedizione ) ) ) {
             $track = trim( (string) $xml->Parcel->NumeroSpedizione );
 
-            // Salva il tracking number nei metadati dell'ordine
+            // Salva il tracking number nei metadati dell'ordine.
+            // _gls_tracking_number  → meta privato (prefisso _), usato internamente dal plugin.
+            // gls_tracking_number   → meta pubblico (senza prefisso _), visibile nella metabox
+            //                         "Campi personalizzati" del backend e accessibile da YayMail
+            //                         tramite la variabile {{gls_tracking_number}}.
             update_post_meta( $order->get_id(), '_gls_tracking_number', $track );
+            update_post_meta( $order->get_id(), 'gls_tracking_number', $track );
 
             // Determina se è una spedizione GLS CHECK (routing fallito)
             $sede_destino    = isset( $xml->Parcel->DescrizioneSedeDestino ) ? trim( (string) $xml->Parcel->DescrizioneSedeDestino ) : '';
@@ -1117,14 +1134,16 @@ class GLS_WooCommerce_Integration_Advanced {
         if ( strpos( $desc_lower, 'avvenuta' ) !== false || strpos( $desc_lower, 'eliminazione' ) !== false ) {
             // Cancellazione avvenuta con successo
             $order->add_order_note( '✅ Spedizione GLS ' . $tracking . ' cancellata con successo sul webservice GLS.' );
-            // Rimuove il tracking number dai metadati per evitare confusione
+            // Rimuove il tracking number dai metadati (sia privato che pubblico)
             delete_post_meta( $order->get_id(), '_gls_tracking_number' );
+            delete_post_meta( $order->get_id(), 'gls_tracking_number' );
             delete_post_meta( $order->get_id(), '_gls_label_pdf_url' );
 
         } elseif ( strpos( $desc_lower, 'non presente' ) !== false ) {
             // Spedizione già non presente sul webservice (es. mai inviata o già cancellata)
             $order->add_order_note( 'ℹ️ Spedizione GLS ' . $tracking . ' non trovata sul webservice (potrebbe essere già stata cancellata).' );
             delete_post_meta( $order->get_id(), '_gls_tracking_number' );
+            delete_post_meta( $order->get_id(), 'gls_tracking_number' );
 
         } elseif ( strpos( $desc_lower, 'funzionalità non abilitata' ) !== false ) {
             // La funzione DeleteSped non è abilitata per questo account GLS
@@ -1559,4 +1578,96 @@ function gls_force_checkout_update() {
         </script>
         <?php
     }
+}
+
+
+// ============================================================================
+// INTEGRAZIONE YAYMAIL — Variabili custom per il tracking GLS
+//
+// YayMail (Email Customizer for WooCommerce) non processa shortcode WordPress
+// standard. Espone invece il filtro yaymail_custom_variables che permette di
+// registrare variabili drag-and-drop nel suo builder visuale.
+//
+// Variabili registrate:
+//   {{gls_tracking_number}} — codice tracking testuale (es. "661209312")
+//   {{gls_tracking_link}}   — link HTML cliccabile con bottone rosso GLS
+//
+// Come usarle in YayMail:
+//   1. Apri YayMail → Email Customizer
+//   2. Seleziona il template (es. "Ordine completato" o "Ordine in lavorazione")
+//   3. Aggiungi un blocco "Testo" o "HTML" nel template
+//   4. Nel pannello variabili (icona {} o "Custom Variables") troverai
+//      "GLS Tracking Number" e "GLS Tracking Link" in fondo alla lista
+//   5. Clicca sulla variabile per inserirla, oppure scrivi {{gls_tracking_number}}
+//      o {{gls_tracking_link}} direttamente nel testo
+//
+// Le variabili restituiscono stringa vuota se il tracking non è ancora disponibile,
+// quindi sono sicure da inserire anche nelle email inviate prima della spedizione.
+// ============================================================================
+
+/**
+ * Registra le variabili custom GLS nel pannello variabili di YayMail.
+ *
+ * Il filtro yaymail_custom_variables riceve e restituisce un array associativo:
+ *   [ 'chiave_variabile' => [ 'label' => '...', 'description' => '...' ] ]
+ * La "chiave" diventa il nome tra {{ }} nel template.
+ *
+ * @param array $variables Variabili già registrate da YayMail e altri plugin
+ * @return array Variabili con quelle GLS aggiunte
+ */
+add_filter( 'yaymail_custom_variables', 'gls_register_yaymail_variables' );
+function gls_register_yaymail_variables( $variables ) {
+    $variables['gls_tracking_number'] = array(
+        'label'       => 'GLS Tracking Number',
+        'description' => 'Codice di tracking GLS (solo testo, es. 661209312).',
+    );
+    $variables['gls_tracking_link'] = array(
+        'label'       => 'GLS Tracking Link',
+        'description' => 'Bottone cliccabile con codice tracking e link al sito GLS.',
+    );
+    return $variables;
+}
+
+/**
+ * Risolve il valore delle variabili custom GLS quando YayMail renderizza l'email.
+ *
+ * YayMail chiama questo filtro per ogni variabile {{...}} trovata nel template,
+ * passando l'oggetto $order relativo all'email in fase di invio.
+ *
+ * @param string   $value   Valore corrente (da sovrascrivere)
+ * @param string   $var_key Chiave della variabile (es. "gls_tracking_number")
+ * @param WC_Order $order   Ordine associato all'email corrente
+ * @return string Testo o HTML sostitutivo, stringa vuota se tracking non disponibile
+ */
+add_filter( 'yaymail_custom_variable_value', 'gls_resolve_yaymail_variable', 10, 3 );
+function gls_resolve_yaymail_variable( $value, $var_key, $order ) {
+    if ( ! in_array( $var_key, array( 'gls_tracking_number', 'gls_tracking_link' ), true ) ) {
+        return $value; // Non è una variabile GLS: lascia invariato
+    }
+
+    if ( ! $order instanceof WC_Order ) {
+        return '';
+    }
+
+    // Legge dal meta privato (fonte canonica del plugin)
+    $tracking = get_post_meta( $order->get_id(), '_gls_tracking_number', true );
+
+    if ( empty( $tracking ) ) {
+        return ''; // Tracking non ancora disponibile: variabile sparisce dal testo
+    }
+
+    $tracking_url = 'https://gls-group.eu/track/' . urlencode( $tracking );
+
+    if ( $var_key === 'gls_tracking_number' ) {
+        // Solo codice testuale: il cliente può copiarlo manualmente
+        return esc_html( $tracking );
+    }
+
+    // gls_tracking_link: bottone stilizzato con il rosso GLS (#e2001a)
+    return '<a href="' . esc_url( $tracking_url ) . '" '
+        . 'target="_blank" rel="noopener noreferrer" '
+        . 'style="display:inline-block;padding:8px 18px;background:#e2001a;color:#ffffff;'
+        . 'text-decoration:none;border-radius:4px;font-weight:bold;font-size:14px;">'
+        . 'Traccia la tua spedizione GLS &rarr;'
+        . '</a>';
 }
