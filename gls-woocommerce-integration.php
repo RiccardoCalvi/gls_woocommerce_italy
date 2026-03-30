@@ -3,12 +3,30 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.3.3
+ * Version: 1.3.4
  * Author: Dream2Dev
  * Requires at least: 5.8
  * Tested up to: 6.7
  * WC requires at least: 7.0
  * WC tested up to: 9.6
+ *
+ * Changelog v1.3.4:
+ *   - Fix errore critico endpoint cronjob: la meta_query con NOT EXISTS in
+ *     combinazione AND causa un fatal error con HPOS attivo. WooCommerce HPOS
+ *     usa OrdersTableQuery che non supporta pienamente il comparatore NOT EXISTS
+ *     in compound meta_query. Soluzione: query semplice con meta_key per trovare
+ *     gli ordini con tracking, poi filtro in PHP per escludere quelli già confermati.
+ *   - Fix CloseWorkDay manuale "senza effetto": il pulsante manuale restituiva
+ *     successo ma non confermava nessun ordine. La causa era la stessa meta_query
+ *     rotta che restituiva 0 risultati. Ora il filtro PHP funziona correttamente.
+ *   - Fix init priority endpoint cron: cambiato da priority 1 (troppo presto,
+ *     WooCommerce potrebbe non essere caricato) a priority 20.
+ *   - Aggiunto try/catch nel cron endpoint per catturare eccezioni e Throwable
+ *     — evita il "white screen" WordPress e logga l'errore effettivo in error_log.
+ *   - Aggiunto check disponibilità WooCommerce nel cron endpoint: se wc_get_orders()
+ *     non è disponibile, restituisce HTTP 503 con messaggio diagnostico.
+ *   - Migliorato logging CWD: logga il conteggio ordini con tracking vs ordini
+ *     in attesa di conferma, per diagnostica immediata.
  *
  * Changelog v1.3.3:
  *   - Cronjob server-side: aggiunto endpoint URL dedicato con token segreto per
@@ -386,7 +404,7 @@ class GLS_WooCommerce_Integration_Advanced {
         // Endpoint URL dedicato per cronjob server-side (Hostinger, cPanel, ecc.)
         // Intercetta le richieste con ?gls_cron_action=close_work_day&token=XXX
         // prima che WordPress carichi il tema — leggero e veloce.
-        add_action( 'init', array( $this, 'handle_cron_endpoint' ), 1 );
+        add_action( 'init', array( $this, 'handle_cron_endpoint' ), 20 );
 
         // Pulizia cron alla disattivazione del plugin
         register_deactivation_hook( __FILE__, array( $this, 'clear_cron' ) );
@@ -1695,16 +1713,34 @@ class GLS_WooCommerce_Integration_Advanced {
             exit;
         }
 
-        // Token valido — esegui CloseWorkDay
+        // Verifica che WooCommerce sia completamente caricato
+        if ( ! function_exists( 'wc_get_orders' ) || ! class_exists( 'WC_Order' ) ) {
+            status_header( 503 );
+            header( 'Content-Type: text/plain; charset=utf-8' );
+            echo 'ERROR - WooCommerce not loaded';
+            error_log( 'GLS Cron Endpoint: WooCommerce non ancora caricato.' );
+            exit;
+        }
+
+        // Token valido — esegui CloseWorkDay con protezione errori
         error_log( 'GLS Cron Endpoint: richiesta ricevuta, esecuzione CloseWorkDay...' );
 
-        // Esegue la chiusura giornaliera
-        $this->execute_close_work_day();
+        try {
+            $this->execute_close_work_day();
+            $message = 'OK - CloseWorkDay executed at ' . gmdate( 'Y-m-d H:i:s' ) . ' UTC';
+            error_log( 'GLS Cron Endpoint: ' . $message );
+        } catch ( \Exception $e ) {
+            $message = 'ERROR - ' . $e->getMessage();
+            error_log( 'GLS Cron Endpoint EXCEPTION: ' . $e->getMessage() );
+        } catch ( \Throwable $t ) {
+            $message = 'FATAL - ' . $t->getMessage();
+            error_log( 'GLS Cron Endpoint FATAL: ' . $t->getMessage() . ' in ' . $t->getFile() . ':' . $t->getLine() );
+        }
 
-        // Risposta di conferma al cronjob
+        // Risposta al cronjob
         status_header( 200 );
         header( 'Content-Type: text/plain; charset=utf-8' );
-        echo 'OK - CloseWorkDay executed at ' . gmdate( 'Y-m-d H:i:s' ) . ' UTC';
+        echo $message;
         exit;
     }
 
@@ -1746,26 +1782,26 @@ class GLS_WooCommerce_Integration_Advanced {
         }
 
         // --- Cerca gli ordini con tracking GLS non ancora confermati ---
-        // Utilizza wc_get_orders() per compatibilità con HPOS.
-        // Cerchiamo ordini che:
-        //   1. Hanno il meta _gls_tracking_number (= spedizione creata con AddParcel)
-        //   2. NON hanno il meta _gls_cwd_closed (= non ancora confermati alla sede)
-        //   3. Sono in stato "processing" (in lavorazione) — gli annullati non vanno confermati
-        $orders = wc_get_orders( array(
-            'status'     => array( 'processing', 'completed' ),
-            'limit'      => 200, // Limite di sicurezza — normalmente le spedizioni giornaliere sono molte meno
-            'meta_query' => array(
-                'relation' => 'AND',
-                array(
-                    'key'     => '_gls_tracking_number',
-                    'compare' => 'EXISTS',
-                ),
-                array(
-                    'key'     => '_gls_cwd_closed',
-                    'compare' => 'NOT EXISTS',
-                ),
-            ),
+        // NOTA v1.3.3-fix: la meta_query con NOT EXISTS + AND relation causa un
+        // errore fatale con HPOS attivo (OrdersTableQuery non supporta pienamente
+        // NOT EXISTS in compound queries). Soluzione: query semplice con meta_key
+        // per trovare ordini con tracking, poi filtro in PHP per escludere i chiusi.
+        $all_orders_with_tracking = wc_get_orders( array(
+            'status'   => array( 'processing', 'completed' ),
+            'limit'    => 200, // Limite di sicurezza — normalmente le spedizioni giornaliere sono molte meno
+            'meta_key' => '_gls_tracking_number',
         ) );
+
+        // Filtra in PHP: mantieni solo gli ordini NON ancora confermati via CWD
+        $orders = array();
+        foreach ( $all_orders_with_tracking as $order ) {
+            $cwd_closed = $order->get_meta( '_gls_cwd_closed', true );
+            if ( empty( $cwd_closed ) ) {
+                $orders[] = $order;
+            }
+        }
+
+        error_log( 'GLS CWD: Trovati ' . count( $all_orders_with_tracking ) . ' ordini con tracking, di cui ' . count( $orders ) . ' in attesa di conferma.' );
 
         // --- Nessun ordine da confermare ---
         if ( empty( $orders ) ) {
