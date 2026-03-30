@@ -3,12 +3,23 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.3.4
+ * Version: 1.3.5
  * Author: Dream2Dev
  * Requires at least: 5.8
  * Tested up to: 6.7
  * WC requires at least: 7.0
  * WC tested up to: 9.6
+ *
+ * Changelog v1.3.5:
+ *   - Fix CWDBSN HTTP 500 "Missing parameter: _xmlRequest": il parametro HTTP POST
+ *     per CloseWorkDayByShipmentNumber è "_xmlRequest" (con underscore), NON "XMLInfo".
+ *     Ogni endpoint .asmx ha un nome parametro diverso:
+ *       AddParcel                       → XMLInfoParcel
+ *       CloseWorkDay                    → XMLInfo
+ *       CloseWorkDayByShipmentNumber    → _xmlRequest
+ *       DeleteSped                      → XMLInfoSped (o XMLInfo, con fallback)
+ *     La documentazione MU162 non specifica i nomi dei parametri HTTP POST —
+ *     sono definiti nel WSDL del servizio e il server li dichiara nell'errore 500.
  *
  * Changelog v1.3.4:
  *   - Fix errore critico endpoint cronjob: la meta_query con NOT EXISTS in
@@ -1845,11 +1856,14 @@ class GLS_WooCommerce_Integration_Advanced {
         error_log( 'GLS CWD: Invio CWDBSN con ' . $tracking_count . ' spedizioni: ' . $tracking_list );
 
         // --- Invio richiesta HTTP POST ---
-        // Il parametro HTTP per CWDBSN è "XMLInfo" (come CloseWorkDay standard)
+        // Il parametro HTTP per CWDBSN è "_xmlRequest" — il server lo dichiara
+        // esplicitamente nell'errore "Missing parameter: _xmlRequest."
+        // NOTA: AddParcel usa "XMLInfoParcel", CloseWorkDay usa "XMLInfo",
+        // ma CloseWorkDayByShipmentNumber usa "_xmlRequest" (con underscore).
         $response = wp_remote_post( $this->api_url_cwdbsn, array(
             'method'  => 'POST',
             'timeout' => 60,
-            'body'    => array( 'XMLInfo' => $xml ),
+            'body'    => array( '_xmlRequest' => $xml ),
         ) );
 
         if ( is_wp_error( $response ) ) {
