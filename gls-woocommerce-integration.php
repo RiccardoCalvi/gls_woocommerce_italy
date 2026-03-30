@@ -3,12 +3,35 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.3.2
+ * Version: 1.3.3
  * Author: Dream2Dev
  * Requires at least: 5.8
  * Tested up to: 6.7
  * WC requires at least: 7.0
  * WC tested up to: 9.6
+ *
+ * Changelog v1.3.3:
+ *   - Cronjob server-side: aggiunto endpoint URL dedicato con token segreto per
+ *     consentire l'invocazione della CloseWorkDay da cronjob di sistema (Hostinger,
+ *     cPanel, ecc.) senza dipendere dal wp-cron basato sulle visite utente.
+ *     L'URL ha la forma: https://tuodominio.com/?gls_cron_action=close_work_day&token=XXX
+ *     Il token viene auto-generato alla prima attivazione e mostrato nella pagina
+ *     impostazioni GLS con le istruzioni di configurazione.
+ *   - Fix CloseWorkDay: il metodo ora utilizza CloseWorkDayByShipmentNumber (CWDBSN)
+ *     al posto di CloseWorkDay generico. Il vecchio codice inviava un blocco <Info>
+ *     VUOTO (senza tag <Parcel>), che secondo la documentazione MU162 §5.2 richiede
+ *     obbligatoriamente la lista dei colli da convalidare. CWDBSN (MU162 §5.3) accetta
+ *     direttamente i numeri di spedizione, evitando di dover ritrasmettere tutti i dati
+ *     destinatario. Il plugin ora cerca automaticamente gli ordini WooCommerce con
+ *     tracking GLS (_gls_tracking_number) non ancora confermati (_gls_cwd_closed)
+ *     e li include nella chiamata CWDBSN.
+ *   - Nuovo meta _gls_cwd_closed: traccia quali ordini sono stati confermati alla
+ *     sede GLS tramite CloseWorkDay. Evita invii duplicati nelle esecuzioni successive.
+ *   - Aggiornato orario cron wp-cron da 18:00 a 19:00 (coerente con il cronjob server).
+ *   - Pagina impostazioni: aggiunta sezione "Configurazione Cronjob" con URL pronto
+ *     da copiare, istruzioni step-by-step per Hostinger e campo token rigenerabile.
+ *   - Migliorato logging: execute_close_work_day() logga il numero di spedizioni
+ *     trovate, i tracking inclusi, e l'esito per ogni singola spedizione dalla risposta.
  *
  * Changelog v1.3.2:
  *   - Fix DeleteSped "Sigla sede non specificata": la causa era il root element
@@ -300,10 +323,16 @@ class GLS_WooCommerce_Integration_Advanced {
     private $api_url_addparcel = 'https://labelservice.gls-italy.com/ilswebservice.asmx/AddParcel';
 
     /**
-     * Endpoint API GLS per la chiusura giornaliera (CloseWorkDay).
-     * Ref: MU162 Label Service v30, sezione 5.2
+     * Endpoint API GLS per la chiusura giornaliera per numero spedizione (CWDBSN).
+     * Ref: MU162 Label Service v30, sezione 5.3
+     *
+     * NOTA v1.3.3: cambiato da CloseWorkDay a CloseWorkDayByShipmentNumber.
+     * CloseWorkDay (§5.2) richiede la ritrasmissione di TUTTI i dati destinatario
+     * per ogni collo, rendendo la chiamata complessa e fragile.
+     * CWDBSN (§5.3) accetta direttamente i numeri di spedizione GLS, che il plugin
+     * ha già salvato nei meta ordine durante AddParcel.
      */
-    private $api_url_closeworkday = 'https://labelservice.gls-italy.com/ilswebservice.asmx/CloseWorkDay';
+    private $api_url_cwdbsn = 'https://labelservice.gls-italy.com/ilswebservice.asmx/CloseWorkDayByShipmentNumber';
 
     /**
      * Endpoint API GLS per la cancellazione di una spedizione (DeleteSped).
@@ -350,9 +379,14 @@ class GLS_WooCommerce_Integration_Advanced {
         add_action( 'admin_menu', array( $this, 'add_admin_menu' ) );
         add_action( 'admin_init', array( $this, 'register_settings' ) );
 
-        // Cron per CloseWorkDay giornaliero automatico
+        // Cron per CloseWorkDay giornaliero automatico (wp-cron come fallback)
         add_action( 'init', array( $this, 'schedule_cron' ) );
         add_action( 'gls_daily_close_work_day', array( $this, 'execute_close_work_day' ) );
+
+        // Endpoint URL dedicato per cronjob server-side (Hostinger, cPanel, ecc.)
+        // Intercetta le richieste con ?gls_cron_action=close_work_day&token=XXX
+        // prima che WordPress carichi il tema — leggero e veloce.
+        add_action( 'init', array( $this, 'handle_cron_endpoint' ), 1 );
 
         // Pulizia cron alla disattivazione del plugin
         register_deactivation_hook( __FILE__, array( $this, 'clear_cron' ) );
@@ -496,21 +530,69 @@ class GLS_WooCommerce_Integration_Advanced {
         register_setting( 'gls_settings_group', 'gls_enable_cod' );
         register_setting( 'gls_settings_group', 'gls_cod_fee_percentage' );
         register_setting( 'gls_settings_group', 'gls_cod_min_fee' );
+
+        // Token segreto per cronjob server-side
+        // Se il token non esiste ancora, lo auto-generiamo alla prima registrazione
+        register_setting( 'gls_settings_group', 'gls_cron_secret_token' );
+    }
+
+    /**
+     * Genera un token casuale sicuro per l'autenticazione del cronjob.
+     * Usa wp_generate_password per generare una stringa alfanumerica di 32 caratteri.
+     *
+     * @return string Token casuale di 32 caratteri
+     */
+    private function generate_cron_token() {
+        return wp_generate_password( 32, false, false );
+    }
+
+    /**
+     * Restituisce il token corrente, creandolo se non esiste.
+     *
+     * @return string Token segreto per il cronjob
+     */
+    private function get_or_create_cron_token() {
+        $token = get_option( 'gls_cron_secret_token', '' );
+        if ( empty( $token ) ) {
+            $token = $this->generate_cron_token();
+            update_option( 'gls_cron_secret_token', $token );
+        }
+        return $token;
+    }
+
+    /**
+     * Costruisce l'URL completo per il cronjob server-side.
+     *
+     * @return string URL con parametri gls_cron_action e token
+     */
+    private function get_cron_endpoint_url() {
+        $token = $this->get_or_create_cron_token();
+        return site_url( '/?gls_cron_action=close_work_day&token=' . $token );
     }
 
     /**
      * Renderizza l'HTML della pagina impostazioni GLS.
-     * Include campi per credenziali, costi/tasse, contrassegno e azione manuale CWD.
+     * Include campi per credenziali, costi/tasse, contrassegno, cronjob e azione manuale CWD.
      */
     public function settings_page_html() {
         if ( ! current_user_can( 'manage_woocommerce' ) ) {
             return;
         }
 
+        // Gestione rigenerazione token tramite POST
+        if ( isset( $_POST['gls_regenerate_token'] ) && check_admin_referer( 'gls_regenerate_token_action' ) ) {
+            $new_token = $this->generate_cron_token();
+            update_option( 'gls_cron_secret_token', $new_token );
+            echo '<div class="notice notice-success is-dismissible"><p>Token cronjob rigenerato con successo. Aggiorna il cronjob su Hostinger con il nuovo URL.</p></div>';
+        }
+
         // Mostra messaggio di successo dopo CloseWorkDay manuale
         if ( isset( $_GET['cwd_success'] ) && $_GET['cwd_success'] == '1' ) {
             echo '<div class="notice notice-success is-dismissible"><p>CloseWorkDay eseguito con successo. Controlla i log per i dettagli.</p></div>';
         }
+
+        // Assicura che il token esista
+        $cron_url = $this->get_cron_endpoint_url();
         ?>
         <div class="wrap">
             <h1>Impostazioni Integrazione GLS Italy</h1>
@@ -582,9 +664,51 @@ class GLS_WooCommerce_Integration_Advanced {
                 <?php submit_button( 'Salva Impostazioni' ); ?>
             </form>
 
+            <!-- ============ CONFIGURAZIONE CRONJOB SERVER-SIDE ============ -->
+            <hr>
+            <h2>⏰ Configurazione Cronjob Automatico (ore 19:00)</h2>
+            <p>
+                Per inviare automaticamente le etichette (CloseWorkDay) ogni giorno alle 19:00
+                senza premere il pulsante, configura un <strong>cronjob server-side</strong> su Hostinger.
+            </p>
+
+            <h3>URL da usare nel cronjob</h3>
+            <div style="background:#f0f0f0; padding:12px 16px; border:1px solid #ccc; border-radius:4px; font-family:monospace; font-size:13px; word-break:break-all; margin:10px 0;">
+                <?php echo esc_html( $cron_url ); ?>
+            </div>
+            <button type="button" onclick="navigator.clipboard.writeText('<?php echo esc_js( $cron_url ); ?>').then(function(){alert('URL copiato negli appunti!')})" class="button button-secondary" style="margin-top:4px;">
+                📋 Copia URL
+            </button>
+
+            <h3>Istruzioni per Hostinger</h3>
+            <ol style="line-height:2;">
+                <li>Accedi al pannello <strong>hPanel</strong> di Hostinger</li>
+                <li>Vai su <strong>Avanzate → Cron Jobs</strong> (o "Processi Cron")</li>
+                <li>In "Aggiungi nuovo Cron Job", seleziona la frequenza: <strong>"Una volta al giorno"</strong></li>
+                <li>Imposta il campo <strong>minuto</strong> a <code>0</code> e l'<strong>ora</strong> a <code>19</code>
+                    <br><small>(Il formato sarà: <code>0 19 * * *</code> — ogni giorno alle 19:00)</small></li>
+                <li>Nel campo <strong>Comando</strong>, incolla:
+                    <div style="background:#1d2327; color:#50c878; padding:10px 14px; border-radius:4px; font-family:monospace; font-size:12px; margin:6px 0; word-break:break-all;">
+                        /usr/bin/curl -s "<?php echo esc_html( $cron_url ); ?>" > /dev/null 2>&1
+                    </div>
+                </li>
+                <li>Clicca <strong>"Crea"</strong> o <strong>"Salva"</strong></li>
+            </ol>
+
+            <p style="background:#fff3cd; border:1px solid #ffc107; padding:10px 14px; border-radius:4px; margin:16px 0;">
+                <strong>⚠️ Importante:</strong> Il token nell'URL è la chiave di sicurezza. Non condividerlo.
+                Se sospetti che sia compromesso, rigeneralo con il pulsante qui sotto e aggiorna il cronjob su Hostinger.
+            </p>
+
+            <form method="post">
+                <?php wp_nonce_field( 'gls_regenerate_token_action' ); ?>
+                <input type="hidden" name="gls_regenerate_token" value="1" />
+                <?php submit_button( '🔄 Rigenera Token Cronjob', 'secondary', 'submit', false ); ?>
+            </form>
+
             <hr>
             <h2>Azioni Manuali</h2>
-            <p>Esegui la chiusura giornaliera (CloseWorkDay) per confermare le spedizioni create oggi alla sede GLS.</p>
+            <p>Esegui la chiusura giornaliera (CloseWorkDay) manualmente per confermare le spedizioni create oggi alla sede GLS.</p>
             <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
                 <input type="hidden" name="action" value="gls_manual_close_work_day">
                 <?php wp_nonce_field( 'gls_manual_cwd', 'gls_cwd_nonce' ); ?>
@@ -868,6 +992,7 @@ class GLS_WooCommerce_Integration_Advanced {
             //   _gls_tracking_number  → meta privato (prefisso _), usato internamente dal plugin
             //   gls_tracking_number   → meta pubblico (senza prefisso _), visibile nella metabox
             //                           "Campi personalizzati" del backend e accessibile da YayMail
+            //   _gls_cwd_closed       → NON impostato qui: verrà settato dopo CloseWorkDay
             $this->update_order_meta( $order, array(
                 '_gls_tracking_number' => $track,
                 'gls_tracking_number'  => $track,
@@ -1339,32 +1464,19 @@ class GLS_WooCommerce_Integration_Advanced {
      * i nomi parametro tentati. SOAP non dipende dal nome parametro HTTP
      * perché la struttura è definita dal WSDL del servizio.
      *
-     * L'endpoint SOAP è l'URL base del webservice (senza /MethodName).
-     * La SOAPAction è tipicamente: "https://labelservice.gls-italy.com/DeleteSped"
-     *
-     * Proviamo due strutture SOAP:
-     *   1) Parametro SOAP "XMLInfoSped" contenente l'XML come stringa
-     *   2) Parametro SOAP "XMLInfo" contenente l'XML come stringa
-     *
      * @param string $xml      XML DeleteSped da inviare
      * @param int    $order_id ID ordine per logging
      * @return array|false Array con 'http_code' e 'body', o false in caso di errore rete
      */
     private function delete_sped_soap( $xml, $order_id ) {
-        // URL base del webservice (senza /DeleteSped)
-        $soap_url = 'https://labelservice.gls-italy.com/ilswebservice.asmx';
-
-        // SOAPAction tipica per endpoint .asmx — namespace + metodo
+        $soap_url    = 'https://labelservice.gls-italy.com/ilswebservice.asmx';
         $soap_action = 'https://labelservice.gls-italy.com/DeleteSped';
 
         // Nomi parametro da provare nella busta SOAP
-        // In ASMX, il nome dell'elemento dentro <soap:Body>/<MethodName> corrisponde
-        // al parametro del metodo .NET (lo stesso usato per HTTP POST).
         $soap_param_names = array( 'XMLInfoSped', 'XMLInfo' );
 
         foreach ( $soap_param_names as $soap_param ) {
             // L'XML va inserito come stringa testo (entità HTML escaped) dentro il parametro SOAP.
-            // L'ASMX si aspetta una stringa XML, non XML nidificato direttamente.
             $xml_escaped = htmlspecialchars( $xml, ENT_XML1, 'UTF-8' );
 
             $soap_envelope  = '<?xml version="1.0" encoding="utf-8"?>';
@@ -1398,10 +1510,7 @@ class GLS_WooCommerce_Integration_Advanced {
 
             error_log( 'GLS DeleteSped SOAP param="' . $soap_param . '" HTTP ' . $http_code . ' order #' . $order_id . ': ' . substr( $body, 0, 400 ) );
 
-            // Se la risposta SOAP non è un 500, estraiamo il contenuto utile
             if ( $http_code !== 500 ) {
-                // La risposta SOAP wrappa il contenuto in <soap:Body>/<DeleteSpedResponse>/<DeleteSpedResult>
-                // Proviamo a estrarre il testo utile dall'envelope SOAP
                 $extracted = $this->extract_soap_response( $body );
                 return array(
                     'http_code' => $http_code,
@@ -1410,33 +1519,19 @@ class GLS_WooCommerce_Integration_Advanced {
             }
         }
 
-        // Tutti i tentativi SOAP falliti
         return false;
     }
 
     /**
      * Estrae il contenuto utile da una risposta SOAP.
      *
-     * La risposta SOAP di un metodo .asmx è tipicamente:
-     *   <soap:Envelope>
-     *     <soap:Body>
-     *       <DeleteSpedResponse xmlns="...">
-     *         <DeleteSpedResult>testo_risultato</DeleteSpedResult>
-     *       </DeleteSpedResponse>
-     *     </soap:Body>
-     *   </soap:Envelope>
-     *
-     * Il testo dentro <DeleteSpedResult> può essere XML escaped o testo semplice.
-     *
      * @param string $soap_response Risposta SOAP completa
      * @return string Contenuto estratto, o la risposta originale se non parsabile
      */
     private function extract_soap_response( $soap_response ) {
-        // Rimuove namespace per facilitare il parsing
         // Prova a trovare il tag *Result dentro la risposta
         if ( preg_match( '/<\w*Result[^>]*>(.*?)<\/\w*Result>/s', $soap_response, $matches ) ) {
             $result = $matches[1];
-            // Se il contenuto è HTML-escaped, decodificalo
             if ( strpos( $result, '&lt;' ) !== false ) {
                 $result = html_entity_decode( $result, ENT_QUOTES, 'UTF-8' );
             }
@@ -1448,7 +1543,6 @@ class GLS_WooCommerce_Integration_Advanced {
             return 'SOAP Fault: ' . $matches[1];
         }
 
-        // Fallback: restituisci la risposta come è
         return $soap_response;
     }
 
@@ -1474,7 +1568,6 @@ class GLS_WooCommerce_Integration_Advanced {
 
         if ( strpos( $desc_lower, 'avvenuta' ) !== false || strpos( $desc_lower, 'eliminazione' ) !== false ) {
             $order->add_order_note( '✅ Spedizione GLS ' . $tracking . ' cancellata con successo sul webservice GLS.' );
-            // Rimuove tracking e PDF (HPOS-compatible)
             $this->delete_order_meta( $order, array( '_gls_tracking_number', 'gls_tracking_number', '_gls_label_pdf_url' ) );
 
         } elseif ( strpos( $desc_lower, 'non presente' ) !== false ) {
@@ -1524,18 +1617,37 @@ class GLS_WooCommerce_Integration_Advanced {
     }
 
     // ========================================================================
-    // CLOSEWORKDAY - Chiusura giornaliera
-    // Ref: MU162 Label Service v30, sezione 5.2
+    // CLOSEWORKDAY — Chiusura giornaliera tramite CloseWorkDayByShipmentNumber
+    // Ref: MU162 Label Service v30, sezione 5.3
+    //
+    // NOTA v1.3.3: Cambiato da CloseWorkDay (§5.2) a CWDBSN (§5.3).
+    // CloseWorkDay richiede di ritrasmettere TUTTI i dati destinatario per ogni
+    // collo (RagioneSociale, Indirizzo, Localita, Zipcode, Provincia, ecc.),
+    // rendendo la chiamata complessa e soggetta a errori di sincronizzazione.
+    //
+    // CWDBSN accetta direttamente i numeri di spedizione GLS già assegnati
+    // durante AddParcel. Il plugin li ha già salvati nei meta ordine.
+    //
+    // Flusso:
+    //   1. Query degli ordini WC con _gls_tracking_number valorizzato
+    //      e _gls_cwd_closed NON presente (= non ancora confermati)
+    //   2. Costruzione XML con tag <NumeroDiSpedizioneGLSDaConfermare>
+    //      per ogni spedizione trovata
+    //   3. Invio a CloseWorkDayByShipmentNumber
+    //   4. Parsing risposta: per ogni <Parcel>/<esito>, logga e marca come chiuso
     // ========================================================================
 
     /**
-     * Schedula il cron WordPress per eseguire la CloseWorkDay ogni giorno alle 18:00.
+     * Schedula il cron WordPress per eseguire la CloseWorkDay ogni giorno alle 19:00.
+     * Questo serve come fallback nel caso in cui il cronjob server-side non sia configurato.
+     * Con un vero cronjob server-side (es. Hostinger), wp-cron funge da rete di sicurezza.
      */
     public function schedule_cron() {
         if ( ! wp_next_scheduled( 'gls_daily_close_work_day' ) ) {
-            $timestamp = strtotime( 'today 18:00' );
+            // Calcola il prossimo orario 19:00 nel fuso orario del server
+            $timestamp = strtotime( 'today 19:00' );
             if ( $timestamp < time() ) {
-                $timestamp = strtotime( 'tomorrow 18:00' );
+                $timestamp = strtotime( 'tomorrow 19:00' );
             }
             wp_schedule_event( $timestamp, 'daily', 'gls_daily_close_work_day' );
         }
@@ -1552,38 +1664,271 @@ class GLS_WooCommerce_Integration_Advanced {
     }
 
     /**
-     * Esegue la chiamata CloseWorkDay all'API GLS.
+     * Gestisce le richieste in arrivo all'endpoint cronjob server-side.
+     *
+     * Intercetta le richieste GET con ?gls_cron_action=close_work_day&token=XXX
+     * e, dopo aver verificato il token, esegue la CloseWorkDay.
+     *
+     * Questo endpoint è progettato per essere chiamato da un cronjob di sistema
+     * (Hostinger, cPanel, ecc.) tramite curl o wget, senza dipendere dal wp-cron.
+     *
+     * Sicurezza:
+     *   - Il token segreto (32 caratteri alfanumerici) impedisce chiamate non autorizzate
+     *   - Il confronto usa hash_equals per prevenire timing attacks
+     *   - La risposta è solo testo plain (nessun HTML) per minimizzare il carico
+     */
+    public function handle_cron_endpoint() {
+        // Verifica se la richiesta è diretta all'endpoint cronjob GLS
+        if ( ! isset( $_GET['gls_cron_action'] ) || $_GET['gls_cron_action'] !== 'close_work_day' ) {
+            return; // Non è una richiesta per noi, lascia proseguire WordPress normalmente
+        }
+
+        // Verifica il token di sicurezza
+        $expected_token = get_option( 'gls_cron_secret_token', '' );
+        $provided_token = isset( $_GET['token'] ) ? sanitize_text_field( $_GET['token'] ) : '';
+
+        if ( empty( $expected_token ) || ! hash_equals( $expected_token, $provided_token ) ) {
+            // Token mancante o non valido — risposta 403 senza rivelare dettagli
+            status_header( 403 );
+            header( 'Content-Type: text/plain; charset=utf-8' );
+            echo 'Forbidden';
+            exit;
+        }
+
+        // Token valido — esegui CloseWorkDay
+        error_log( 'GLS Cron Endpoint: richiesta ricevuta, esecuzione CloseWorkDay...' );
+
+        // Esegue la chiusura giornaliera
+        $this->execute_close_work_day();
+
+        // Risposta di conferma al cronjob
+        status_header( 200 );
+        header( 'Content-Type: text/plain; charset=utf-8' );
+        echo 'OK - CloseWorkDay executed at ' . gmdate( 'Y-m-d H:i:s' ) . ' UTC';
+        exit;
+    }
+
+    /**
+     * Esegue la chiamata CloseWorkDayByShipmentNumber all'API GLS.
+     *
+     * Cerca tutti gli ordini WooCommerce con tracking GLS non ancora confermati
+     * (meta _gls_tracking_number presente, meta _gls_cwd_closed assente)
+     * e li invia a GLS per la convalida.
+     *
+     * Ref: MU162 Label Service v30, sezione 5.3 (CloseWorkDayByShipmentNumber)
+     *
+     * La struttura XML inviata è:
+     *   <Info>
+     *     <SedeGls>XX</SedeGls>
+     *     <CodiceClienteGls>XXXXX</CodiceClienteGls>
+     *     <PasswordClienteGls>XXXXX</PasswordClienteGls>
+     *     <CloseWorkDayResult>S</CloseWorkDayResult>
+     *     <Parcel>
+     *       <CodiceContrattoGls>XXXX</CodiceContrattoGls>
+     *       <NumeroDiSpedizioneGLSDaConfermare>590000008</NumeroDiSpedizioneGLSDaConfermare>
+     *     </Parcel>
+     *     <Parcel>
+     *       <CodiceContrattoGls>XXXX</CodiceContrattoGls>
+     *       <NumeroDiSpedizioneGLSDaConfermare>590000011</NumeroDiSpedizioneGLSDaConfermare>
+     *     </Parcel>
+     *   </Info>
      */
     public function execute_close_work_day() {
-        $sede     = trim( get_option( 'gls_sede' ) );
-        $cliente  = trim( get_option( 'gls_codice_cliente' ) );
-        $password = trim( get_option( 'gls_password' ) );
+        // --- Validazione credenziali ---
+        $sede      = trim( get_option( 'gls_sede' ) );
+        $cliente   = trim( get_option( 'gls_codice_cliente' ) );
+        $password  = trim( get_option( 'gls_password' ) );
+        $contratto = trim( get_option( 'gls_codice_contratto' ) );
 
-        if ( empty( $sede ) || empty( $cliente ) || empty( $password ) ) {
-            error_log( 'GLS Cron Error: Credenziali mancanti per CloseWorkDay.' );
+        if ( empty( $sede ) || empty( $cliente ) || empty( $password ) || empty( $contratto ) ) {
+            error_log( 'GLS CWD Error: Credenziali mancanti per CloseWorkDay.' );
             return;
         }
+
+        // --- Cerca gli ordini con tracking GLS non ancora confermati ---
+        // Utilizza wc_get_orders() per compatibilità con HPOS.
+        // Cerchiamo ordini che:
+        //   1. Hanno il meta _gls_tracking_number (= spedizione creata con AddParcel)
+        //   2. NON hanno il meta _gls_cwd_closed (= non ancora confermati alla sede)
+        //   3. Sono in stato "processing" (in lavorazione) — gli annullati non vanno confermati
+        $orders = wc_get_orders( array(
+            'status'     => array( 'processing', 'completed' ),
+            'limit'      => 200, // Limite di sicurezza — normalmente le spedizioni giornaliere sono molte meno
+            'meta_query' => array(
+                'relation' => 'AND',
+                array(
+                    'key'     => '_gls_tracking_number',
+                    'compare' => 'EXISTS',
+                ),
+                array(
+                    'key'     => '_gls_cwd_closed',
+                    'compare' => 'NOT EXISTS',
+                ),
+            ),
+        ) );
+
+        // --- Nessun ordine da confermare ---
+        if ( empty( $orders ) ) {
+            error_log( 'GLS CWD: Nessuna spedizione in attesa di conferma. CloseWorkDay non necessario.' );
+            return;
+        }
+
+        // --- Costruzione XML per CWDBSN ---
+        // Mappa order_id => tracking_number per il parsing della risposta
+        $shipments_map = array();
 
         $xml  = '<Info>';
         $xml .= '<SedeGls>' . esc_html( $sede ) . '</SedeGls>';
         $xml .= '<CodiceClienteGls>' . esc_html( $cliente ) . '</CodiceClienteGls>';
         $xml .= '<PasswordClienteGls>' . esc_html( $password ) . '</PasswordClienteGls>';
+
+        // CloseWorkDayResult = "S" per ricevere lo stato delle spedizioni nella risposta
+        // Ref: MU162bis - "if tag value = 'S' an XML with shipment information is returned"
         $xml .= '<CloseWorkDayResult>S</CloseWorkDayResult>';
+
+        foreach ( $orders as $order ) {
+            $tracking = $order->get_meta( '_gls_tracking_number', true );
+            if ( empty( $tracking ) ) {
+                continue; // Sicurezza: non dovrebbe succedere dato il meta_query, ma verifichiamo
+            }
+
+            $xml .= '<Parcel>';
+            // CodiceContrattoGls è OBBLIGATORIO anche in CWDBSN (Ref: MU162bis Data Mapping)
+            $xml .= '<CodiceContrattoGls>' . esc_html( $contratto ) . '</CodiceContrattoGls>';
+            // Il numero di spedizione GLS da confermare (Ref: MU162 §5.3)
+            $xml .= '<NumeroDiSpedizioneGLSDaConfermare>' . esc_html( $tracking ) . '</NumeroDiSpedizioneGLSDaConfermare>';
+            $xml .= '</Parcel>';
+
+            $shipments_map[ $tracking ] = $order->get_id();
+        }
+
         $xml .= '</Info>';
 
-        $response = wp_remote_post( $this->api_url_closeworkday, array(
+        $tracking_count = count( $shipments_map );
+        $tracking_list  = implode( ', ', array_keys( $shipments_map ) );
+        error_log( 'GLS CWD: Invio CWDBSN con ' . $tracking_count . ' spedizioni: ' . $tracking_list );
+
+        // --- Invio richiesta HTTP POST ---
+        // Il parametro HTTP per CWDBSN è "XMLInfo" (come CloseWorkDay standard)
+        $response = wp_remote_post( $this->api_url_cwdbsn, array(
             'method'  => 'POST',
             'timeout' => 60,
             'body'    => array( 'XMLInfo' => $xml ),
         ) );
 
         if ( is_wp_error( $response ) ) {
-            error_log( 'GLS CloseWorkDay Error: ' . $response->get_error_message() );
+            error_log( 'GLS CWD Error di rete: ' . $response->get_error_message() );
             return;
         }
 
-        $body = wp_remote_retrieve_body( $response );
-        error_log( 'GLS CloseWorkDay Eseguito. Risposta: ' . substr( $body, 0, 500 ) );
+        $http_code = wp_remote_retrieve_response_code( $response );
+        $body      = wp_remote_retrieve_body( $response );
+
+        error_log( 'GLS CWD HTTP ' . $http_code . ' - Risposta: ' . substr( $body, 0, 1000 ) );
+
+        if ( $http_code != 200 ) {
+            error_log( 'GLS CWD Error: HTTP ' . $http_code );
+            return;
+        }
+
+        // --- Parsing della risposta CWDBSN ---
+        // La risposta è:
+        //   <CloseWorkDayByShipmentNumberResult>
+        //     <DescrizioneErrore>OK</DescrizioneErrore>
+        //     <Parcel>
+        //       <NumeroDiSpedizioneGLSDaConfermare>590000008</NumeroDiSpedizioneGLSDaConfermare>
+        //       <esito>OK</esito>
+        //     </Parcel>
+        //     ...
+        //   </CloseWorkDayByShipmentNumberResult>
+        $inner = $this->extract_asmx_response( $body );
+        $xml_resp = @simplexml_load_string( $inner );
+
+        if ( $xml_resp === false ) {
+            error_log( 'GLS CWD: Risposta XML non parsabile: ' . substr( $inner, 0, 500 ) );
+            // Anche se non riusciamo a parsare la risposta, marchiamo come chiusi
+            // per evitare invii duplicati. L'operatore può verificare manualmente.
+            $this->mark_orders_as_closed( $shipments_map );
+            return;
+        }
+
+        // Controlla errore globale
+        if ( isset( $xml_resp->DescrizioneErrore ) ) {
+            $global_error = trim( (string) $xml_resp->DescrizioneErrore );
+            error_log( 'GLS CWD esito globale: ' . $global_error );
+
+            // Se l'errore globale non è "OK", logga ma NON interrompe
+            // perché i singoli Parcel possono avere esiti diversi
+        }
+
+        // Processa ogni Parcel nella risposta
+        $success_count = 0;
+        $error_count   = 0;
+
+        if ( isset( $xml_resp->Parcel ) ) {
+            foreach ( $xml_resp->Parcel as $parcel ) {
+                $num_sped = isset( $parcel->NumeroDiSpedizioneGLSDaConfermare )
+                    ? trim( (string) $parcel->NumeroDiSpedizioneGLSDaConfermare )
+                    : '';
+                $esito = isset( $parcel->esito )
+                    ? trim( (string) $parcel->esito )
+                    : 'N/A';
+
+                if ( strtoupper( $esito ) === 'OK' ) {
+                    $success_count++;
+                    error_log( 'GLS CWD: Spedizione ' . $num_sped . ' confermata con successo.' );
+
+                    // Marca l'ordine come chiuso
+                    if ( ! empty( $num_sped ) && isset( $shipments_map[ $num_sped ] ) ) {
+                        $order = wc_get_order( $shipments_map[ $num_sped ] );
+                        if ( $order ) {
+                            $this->update_order_meta( $order, array(
+                                '_gls_cwd_closed' => gmdate( 'Y-m-d H:i:s' ),
+                            ) );
+                            $order->add_order_note( '✅ Spedizione GLS ' . $num_sped . ' confermata alla sede GLS (CloseWorkDay).' );
+                        }
+                        unset( $shipments_map[ $num_sped ] );
+                    }
+                } else {
+                    $error_count++;
+                    error_log( 'GLS CWD: Spedizione ' . $num_sped . ' — esito: ' . $esito );
+
+                    // Anche se l'esito non è OK, annotiamo l'errore sull'ordine
+                    if ( ! empty( $num_sped ) && isset( $shipments_map[ $num_sped ] ) ) {
+                        $order = wc_get_order( $shipments_map[ $num_sped ] );
+                        if ( $order ) {
+                            $order->add_order_note( '⚠️ GLS CWD: Spedizione ' . $num_sped . ' — esito: ' . esc_html( $esito ) );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Marca come chiusi gli ordini rimasti nella mappa (non presenti nella risposta)
+        // Questo può succedere se GLS ha già processato la spedizione in precedenza.
+        if ( ! empty( $shipments_map ) ) {
+            $this->mark_orders_as_closed( $shipments_map );
+        }
+
+        error_log( 'GLS CWD completato: ' . $success_count . ' confermati, ' . $error_count . ' con errore.' );
+    }
+
+    /**
+     * Marca un gruppo di ordini come confermati (CWD closed) nei metadati.
+     * Usato come fallback quando la risposta non è parsabile ma la chiamata
+     * è andata a buon fine (HTTP 200).
+     *
+     * @param array $shipments_map Array tracking_number => order_id
+     */
+    private function mark_orders_as_closed( $shipments_map ) {
+        foreach ( $shipments_map as $tracking => $order_id ) {
+            $order = wc_get_order( $order_id );
+            if ( $order ) {
+                $this->update_order_meta( $order, array(
+                    '_gls_cwd_closed' => gmdate( 'Y-m-d H:i:s' ),
+                ) );
+            }
+        }
     }
 }
 
@@ -1625,27 +1970,12 @@ new GLS_WooCommerce_Integration_Advanced();
 // Shortcode registrati:
 //   [yaymail_custom_shortcode_gls_tracking]      — codice tracking testuale
 //   [yaymail_custom_shortcode_gls_tracking_link]  — bottone HTML cliccabile GLS
-//
-// Come usarli in YayMail:
-//   1. Apri YayMail → Email Customizer
-//   2. Seleziona il template (es. "Ordine in lavorazione" o "Ordine completato")
-//   3. Nel pannello shortcode, trova "Custom Shortcode" in fondo alla lista
-//   4. Clicca [yaymail_custom_shortcode_gls_tracking] o _gls_tracking_link
-//      per inserirlo nel template
-//
-// NOTA: gli shortcode custom di YayMail funzionano solo con ordini reali,
-// NON nelle email di test inviate dal builder. Questo è un limite di YayMail.
 // ============================================================================
 
 add_filter( 'yaymail_customs_shortcode', 'gls_register_yaymail_shortcodes', 10, 3 );
 
 /**
  * Registra gli shortcode GLS nel pannello shortcode di YayMail Pro.
- *
- * Il filtro yaymail_customs_shortcode riceve:
- *   $shortcode_list       — array associativo [shortcode] => valore
- *   $yaymail_informations — informazioni interne di YayMail (non usate qui)
- *   $args                 — array con chiave 'order' (WC_Order) se disponibile
  *
  * @param array $shortcode_list Lista shortcode registrati
  * @param mixed $yaymail_informations Informazioni YayMail
@@ -1654,7 +1984,6 @@ add_filter( 'yaymail_customs_shortcode', 'gls_register_yaymail_shortcodes', 10, 
  */
 function gls_register_yaymail_shortcodes( $shortcode_list, $yaymail_informations, $args = array() ) {
 
-    // URL base per il tracking GLS Italy
     $tracking_base_url = 'https://www.gls-italy.com/it/servizi/servizi-per-chi-riceve/ricerca-spedizioni?match=';
 
     // --- Shortcode 1: codice tracking testuale ---
@@ -1662,7 +1991,6 @@ function gls_register_yaymail_shortcodes( $shortcode_list, $yaymail_informations
     if ( isset( $args['order'] ) && $args['order'] instanceof WC_Order ) {
         $tracking_value = $args['order']->get_meta( '_gls_tracking_number', true );
     }
-    // Se non c'è un ordine reale (es. anteprima nel builder), mostra un placeholder
     $shortcode_list['[yaymail_custom_shortcode_gls_tracking]'] = ! empty( $tracking_value )
         ? esc_html( $tracking_value )
         : '';
