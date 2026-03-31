@@ -3,7 +3,7 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.3.6
+ * Version: 1.3.7
  * Author: Dream2Dev
  * Requires at least: 5.8
  * Tested up to: 6.7
@@ -2187,7 +2187,21 @@ function gls_custom_shipping_method_init() {
                 $free_threshold           = (float) get_option( 'gls_free_shipping_threshold', '0' );
                 $cart_total_for_threshold = WC()->cart->get_cart_contents_total() + WC()->cart->get_cart_contents_tax();
 
-                if ( $free_threshold > 0 && $cart_total_for_threshold >= $free_threshold ) {
+                // Controllo se ci sono coupon applicati che omaggiano la spedizione
+                $has_free_shipping_coupon = false;
+                if ( WC()->cart && ! empty( WC()->cart->get_applied_coupons() ) ) {
+                    foreach ( WC()->cart->get_applied_coupons() as $coupon_code ) {
+                        $coupon = new WC_Coupon( $coupon_code );
+                        // Se il coupon è valido e ha l'impostazione "Consenti spedizione gratuita" attiva
+                        if ( $coupon->get_free_shipping() ) {
+                            $has_free_shipping_coupon = true;
+                            break; // Trovato uno, non serve cercare oltre
+                        }
+                    }
+                }
+
+                // Azzera il costo se si supera la soglia O se è presente un coupon per la spedizione gratuita
+                if ( ( $free_threshold > 0 && $cart_total_for_threshold >= $free_threshold ) || $has_free_shipping_coupon ) {
                     $cost_with_vat = 0;
                 }
 
