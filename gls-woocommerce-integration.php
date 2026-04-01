@@ -3,7 +3,7 @@
  * Plugin Name: GLS Italy WooCommerce Integration
  * Plugin URI: https://github.com/RiccardoCalvi/gls_woocommerce_italy
  * Description: Integrazione API GLS (Etichette) + Calcolo Tariffe di Spedizione e Contrassegno.
- * Version: 1.4.0
+ * Version: 1.4.1
  * Author: Dream2Dev
  * Requires at least: 5.8
  * Tested up to: 6.7
